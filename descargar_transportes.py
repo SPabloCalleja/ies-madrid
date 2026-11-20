@@ -1,12 +1,14 @@
 """
-Paso 2a (v3): descargar, VALIDAR y APLANAR los 5 GTFS + el callejero OSM.
+Paso 2a (v4): descargar, VALIDAR y APLANAR los 5 GTFS + el callejero OSM.
 - Valida que cada zip tenga los ficheros GTFS obligatorios en la raiz.
 - Si los trae anidados en una subcarpeta (p.ej. google_transit_M89/), la aplana.
 - URL de respaldo para cada feed.
+- OSM: lista de URLs candidatas y comprobacion de tamano minimo (un pbf de
+  Madrid son ~80 MB; 2 KB son una pagina de error).
 
 Uso:
     python descargar_transportes.py                # todo
-    python descargar_transportes.py interurbanos   # solo ese feed
+    python descargar_transportes.py interurbanos   # solo ese feed (metro|emt|interurbanos|ligero|cercanias|osm)
 """
 import sys
 import io
@@ -14,6 +16,8 @@ import csv
 import os
 import zipfile
 import requests
+
+OBLIGATORIOS = ["agency.txt", "stops.txt", "routes.txt", "trips.txt", "stop_times.txt"]
 
 FEEDS = {
     "metro": ("gtfs_metro.zip", [
@@ -37,8 +41,11 @@ FEEDS = {
         "https://crtm.maps.arcgis.com/sharing/rest/content/items/1a25440bf66f499bae2657ec7fb40144/data",
     ]),
 }
-OSM_URL = "https://download.geofabrik.de/europe/spain/madrid-latest.osm.pbf"
-OBLIGATORIOS = ["agency.txt", "stops.txt", "routes.txt", "trips.txt", "stop_times.txt"]
+OSM_URLS = [
+    # Verificada en https://download.geofabrik.de/europe/spain/madrid.html
+    "https://download.geofabrik.de/europe/spain/madrid-latest.osm.pbf",
+]
+OSM_MIN_MB = 50   # un pbf real de la Comunidad de Madrid pesa ~80 MB
 
 def descargar(url, destino):
     with requests.get(url, stream=True, timeout=600) as r:
@@ -61,8 +68,6 @@ def validar_gtfs(ruta):
         return False
 
 def aplanar_gtfs(ruta):
-    """Si los ficheros GTFS estan dentro de una subcarpeta (p.ej. google_transit_M89/),
-    reempaqueta el zip dejandolos en la raiz."""
     with zipfile.ZipFile(ruta) as z:
         raiz = set(n.split("/", 1)[0] for n in z.namelist() if not n.endswith("/"))
         if len(raiz) != 1:
@@ -112,6 +117,25 @@ def bajar_feed(clave):
         print("  Probando URL de respaldo ...")
     return False
 
+def bajar_osm():
+    destino = "madrid-latest.osm.pbf"
+    for url in OSM_URLS:
+        print(f"Descargando {destino} desde {url} ...")
+        try:
+            descargar(url, destino)
+        except Exception as e:
+            print(f"  ERROR de descarga: {e}")
+            continue
+        mb = os.path.getsize(destino) / 1e6
+        if mb < OSM_MIN_MB:
+            print(f"  INVALIDO: pesa {mb:.1f} MB (se esperaban ~80 MB); "
+                  f"parece una pagina de error, no el pbf")
+            continue
+        print(f"  OK: {mb:.0f} MB")
+        return True
+    raise SystemExit("No pude descargar el OSM. Revisa la URL en "
+                    "https://download.geofabrik.de/europe/spain.html (region Madrid)")
+
 if __name__ == "__main__":
     solo = sys.argv[1] if len(sys.argv) > 1 else None
     todo_ok = True
@@ -119,8 +143,7 @@ if __name__ == "__main__":
         if solo in (None, clave):
             todo_ok &= bajar_feed(clave)
     if solo in (None, "osm"):
-        print("Descargando madrid-latest.osm.pbf ...")
-        descargar(OSM_URL, "madrid-latest.osm.pbf")
+        bajar_osm()
     if not todo_ok:
         sys.exit("FALLO: algun GTFS no se pudo validar. NO lances el build hasta arreglarlo.")
     print("\nTodo validado. Copia los 5 .zip y el .osm.pbf a otp/data/ y reconstruye.")
