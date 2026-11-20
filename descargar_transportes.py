@@ -1,19 +1,23 @@
 """
-Paso 2a (v6): descargar, VALIDAR y APLANAR los 5 GTFS + el callejero OSM.
-v6: si el fichero -latest de Geofabrik falla (ahora mismo redirige a una URL
-rota), raspa la pagina de la region y baja el snapshot FECHADO mas reciente
-(p.ej. madrid-261115.osm.pbf). Para OTP es equivalente: el callejero no cambia
-en dias; lo que caduca son los GTFS.
+Paso 2a (v7): descargar, VALIDAR y APLANAR los 5 GTFS + el callejero OSM.
+v7: Geofabrik reorganizo rutas (blog 19.11.2026): los .pbf de region pasan de
+/europe/spain/madrid-latest.osm.pbf a /europe/spain/madrid/madrid-latest.osm.pbf
+y las redirecciones de URLs viejas estan rotas temporalmente. Estrategia:
+  1. URL nueva (canonica actual)
+  2. URL vieja (por si vuelven a arreglar el redirect)
+  3. Indice JSON oficial de Geofabrik (urls.pbf autoritativo por region)
+  4. Snapshot fechado mas reciente, raspado de la pagina de la region
 
 Uso:
     python descargar_transportes.py                # todo
-    python descargar_transportes.py interurbanos   # solo ese feed (metro|emt|interurbanos|ligero|cercanias|osm)
+    python descargar_transportes.py osm             # solo el OSM
 """
 import re
 import sys
 import io
 import csv
 import os
+import json
 import zipfile
 import requests
 
@@ -41,8 +45,13 @@ FEEDS = {
         "https://crtm.maps.arcgis.com/sharing/rest/content/items/1a25440bf66f499bae2657ec7fb40144/data",
     ]),
 }
-# Pagina de la region Madrid (fuente de verdad de las URLs de ficheros)
-OSM_PAGINA = "https://download.geofabrik.de/europe/spain/madrid.html"
+OSM_NUEVA = "https://download.geofabrik.de/europe/spain/madrid/madrid-latest.osm.pbf"
+OSM_VIEJA = "https://download.geofabrik.de/europe/spain/madrid-latest.osm.pbf"
+OSM_INDICE = "https://download.geofabrik.de/index-v1-nogeom.json"
+OSM_PAGINAS = [
+    "https://download.geofabrik.de/europe/spain/madrid/",
+    "https://download.geofabrik.de/europe/spain/madrid.html",
+]
 OSM_MIN_MB = 50
 
 def _sesion():
@@ -59,6 +68,64 @@ def descargar(url, destino):
         with open(destino, "wb") as f:
             for chunk in r.iter_content(1 << 20):
                 f.write(chunk)
+
+def _pesa_ok(destino):
+    mb = os.path.getsize(destino) / 1e6
+    if mb < OSM_MIN_MB:
+        print(f"  INVALIDO: pesa {mb:.1f} MB (se esperaban ~80)")
+        return False
+    print(f"  OK: {mb:.0f} MB")
+    return True
+
+def url_osm_desde_indice():
+    """Indice JSON oficial de Geofabrik: urls.pbf autoritativo para cada region.
+    Busca la region de Madrid dentro de Espana (id 'esmd' o nombre)."""
+    try:
+        r = _sesion().get(OSM_INDICE, timeout=120)
+        r.raise_for_status()
+        datos = json.loads(r.text)
+        for f in datos.get("features", []):
+            p = f.get("properties", {})
+            urls = p.get("urls", {}) or {}
+            es_madrid = (p.get("id") == "esmd"
+                         or (p.get("parent") == "es" and "Madrid" in (p.get("name") or "")))
+            if es_madrid and urls.get("pbf"):
+                return urls["pbf"]
+    except Exception as e:
+        print(f"  (indice JSON no disponible: {e})")
+    return None
+
+def url_osm_fechada():
+    """Raspa la pagina de la region y devuelve el snapshot fechado mas reciente."""
+    for pagina in OSM_PAGINAS:
+        try:
+            r = _sesion().get(pagina, timeout=60)
+            r.raise_for_status()
+            fechas = re.findall(r"madrid-(\d{6})\.osm\.pbf", r.text)
+            if fechas:
+                base = pagina if pagina.endswith("/") else pagina.rsplit("/", 1)[0]
+                return f"{base.rstrip('/')}/madrid-{max(fechas)}.osm.pbf"
+        except Exception:
+            continue
+    return None
+
+def bajar_osm():
+    destino = "madrid-latest.osm.pbf"
+    candidatos = [OSM_NUEVA, OSM_VIEJA]
+    candidatos.append(url_osm_desde_indice())
+    candidatos.append(url_osm_fechada())
+    for url in [u for u in candidatos if u]:
+        print(f"Descargando OSM desde {url} ...")
+        try:
+            descargar(url, destino)
+        except Exception as e:
+            print(f"  ERROR de descarga: {e}")
+            continue
+        if _pesa_ok(destino):
+            return True
+    raise SystemExit("No pude descargar el OSM de Geofabrik. Consulta "
+                     "https://blog.geofabrik.de/ (anuncios de mantenimiento) y "
+                     "https://download.geofabrik.de/europe/spain.html")
 
 def validar_gtfs(ruta):
     try:
@@ -122,48 +189,6 @@ def bajar_feed(clave):
             return True
         print("  Probando URL de respaldo ...")
     return False
-
-def url_osm_fechada():
-    """Raspa la pagina de la region y devuelve la URL del snapshot fechado mas
-    reciente (p.ej. .../madrid-261115.osm.pbf). None si no puede."""
-    r = _sesion().get(OSM_PAGINA, timeout=60)
-    r.raise_for_status()
-    fechas = re.findall(r"madrid-(\d{6})\.osm\.pbf", r.text)
-    if not fechas:
-        return None
-    fecha = max(fechas)
-    base = OSM_PAGINA.rsplit("/", 1)[0]
-    return f"{base}/madrid-{fecha}.osm.pbf"
-
-def bajar_osm():
-    destino = "madrid-latest.osm.pbf"
-    candidatos = [f"{OSM_PAGINA.rsplit('/', 1)[0]}/madrid-latest.osm.pbf"]
-    for url in candidatos:
-        print(f"Descargando OSM desde {url} ...")
-        try:
-            descargar(url, destino)
-        except Exception as e:
-            print(f"  ERROR de descarga: {e}")
-        else:
-            if os.path.getsize(destino) / 1e6 >= OSM_MIN_MB:
-                print(f"  OK: {os.path.getsize(destino)/1e6:.0f} MB")
-                return True
-            print("  INVALIDO: pesa menos de lo esperado")
-    # fallback: snapshot fechado mas reciente
-    print("Buscando el snapshot fechado mas reciente en la pagina de la region...")
-    url = url_osm_fechada()
-    if url:
-        print(f"Descargando OSM desde {url} ...")
-        try:
-            descargar(url, destino)
-        except Exception as e:
-            print(f"  ERROR de descarga: {e}")
-        else:
-            if os.path.getsize(destino) / 1e6 >= OSM_MIN_MB:
-                print(f"  OK: {os.path.getsize(destino)/1e6:.0f} MB (snapshot fechado)")
-                return True
-    raise SystemExit("No pude descargar el OSM de Geofabrik. Revisa manualmente "
-                     + OSM_PAGINA)
 
 if __name__ == "__main__":
     solo = sys.argv[1] if len(sys.argv) > 1 else None
