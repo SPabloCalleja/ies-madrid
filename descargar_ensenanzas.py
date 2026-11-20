@@ -1,17 +1,21 @@
 """
-Paso 1b: enriquecer los IES con ensenanzas y turnos desde el Buscador de
+Paso 1b (v2): enriquecer los IES con ensenanzas y turnos desde el Buscador de
 centros de la Comunidad de Madrid (Servicio Web a Padres de Alumnos).
-Para cada CODIGO descarga su ficha (MostrarFichaCentro.icm?cdCentro=...) y
-extrae: ESO, Bachillerato, FP, vespertino, nocturno, bilingue, jornada.
+v2:
+  - Las secciones se anclan en la ULTIMA aparicion del titulo (la pagina tiene
+    un menu superior con los mismos textos, que antes secuestraba la extraccion)
+  - Repara estados corruptos: reintenta filas fallidas (a None) y columnas
+    fusionadas vacias en ies_publicos_madrid.csv
+  - Los errores se loguean con numero de linea exacto
 
 Fuente: https://gestiona.comunidad.madrid/wpad_pub/run/j/MostrarFichaCentro.icm
-Requisitos: uv add requests pandas
-Uso: uv run descargar_ensenanzas.py            # procesa los que falten (reanudable)
-     uv run descargar_ensenanzas.py --todos    # rehace todos
+Uso: uv run descargar_ensenanzas.py          (reanudable, reintenta los fallidos)
+     uv run descargar_ensenanzas.py --todos
 """
 import re
 import sys
 import time
+import traceback
 import requests
 import pandas as pd
 
@@ -32,14 +36,19 @@ def _texto(html):
 def _filas(seccion_html):
     return [_texto(f) for f in re.findall(r"<tr[^>]*>(.*?)</tr>", seccion_html, re.S | re.I)]
 
-def _seccion(html, desde, hasta):
-    m = re.search(desde + r"(.*?)" + hasta, html, re.S | re.I)
-    return m.group(1) if m else ""
+def _seccion(html, titulo, siguiente_patron):
+    """Toma desde la ULTIMA aparicion de 'titulo' (el menu superior de la pagina
+    tambien contiene los titulos y nos robaria el trozo) hasta 'siguiente_patron'."""
+    pos = html.upper().rfind(titulo.upper())
+    if pos == -1:
+        return ""
+    resto = html[pos:]
+    m = re.search(siguiente_patron, resto, re.I)
+    return resto[:m.start()] if m else resto
 
 def _marcado(seccion_html, patron):
     """True si la CELDA que contiene 'patron' parece marcada (checkbox checked
-    o imagen de check dentro de esa misma celda). Se mira por celda, no por
-    fila, porque las fichas ponen todas las opciones en la misma fila."""
+    o imagen de check dentro de esa misma celda)."""
     celdas = re.findall(r"<td[^>]*>(.*?)</td>", seccion_html, re.S | re.I)
     for c in celdas:
         if re.search(patron, c, re.I) and re.search(r"checked|selected|<img[^>]*(ok|check|tick|verde)", c, re.I):
@@ -47,7 +56,9 @@ def _marcado(seccion_html, patron):
     return False
 
 def extraer_caracteristicas(html):
-    etapas = _seccion(html, "ETAPAS EDUCATIVAS", "OPCIONES LING")
+    if not html:
+        raise ValueError("la ficha llego vacia (posible pagina de sesion/error)")
+    etapas = _seccion(html, "ETAPAS EDUCATIVAS", r"OPCIONES LING")
     filas = _filas(etapas)
     texto = _texto(etapas)
 
@@ -60,9 +71,9 @@ def extraer_caracteristicas(html):
     modalidades_bach = [f.strip() for f in filas
                         if re.search(r"Ciencias y Tecnología|Humanidades|Artes|General", f)]
 
-    jornada = _seccion(html, r"Jornada:?", "Integración|ADSCRIPCIÓN")
-    dividida = _marcado(jornada, "dividida")
-    continuada = _marcado(jornada, "continuada")
+    jornada_html = _seccion(html, "Jornada", r"(?:Integraci[oó]n|ADSCRIPCI)")
+    dividida = _marcado(jornada_html, "dividida")
+    continuada = _marcado(jornada_html, "continuada")
     if dividida and not continuada:
         jornada_txt = "dividida (2 sesiones / turno de tarde)"
     elif continuada and not dividida:
@@ -82,6 +93,12 @@ def procesar(todos=False):
         previo = pd.read_csv(SALIDA, dtype={"CODIGO": str}) if not todos else None
     except FileNotFoundError:
         previo = None
+    if previo is not None:
+        # reparacion: las filas fallidas (tiene_eso a NaN) cuentan como pendientes
+        fallidas = previo["tiene_eso"].isna().sum()
+        if fallidas:
+            print(f"Reparando {fallidas} filas fallidas de un run anterior")
+        previo = previo.dropna(subset=["tiene_eso"])
     hechos = set(previo["CODIGO"]) if previo is not None else set()
 
     sesion = _sesion()
@@ -92,11 +109,12 @@ def procesar(todos=False):
     errores = 0
     for n, codigo in enumerate(pendientes, 1):
         try:
-            r = sesion.get(FICHA, params={"cdCentro": codigo}, timeout=60)
+            r = sesion.get(FICHA, params={"cdCentro": str(codigo)}, timeout=60)
             r.raise_for_status()
             caracteristicas = extraer_caracteristicas(r.text)
         except Exception as e:
-            print(f"  ERROR en {codigo}: {e}")
+            linea = traceback.extract_tb(e.__traceback__)[-1].lineno
+            print(f"  ERROR en {codigo}: {type(e).__name__}: {e} (linea {linea})")
             errores += 1
             caracteristicas = {k: None for k in
                                ["tiene_eso", "tiene_bachillerato", "tiene_fp",
@@ -113,7 +131,12 @@ def procesar(todos=False):
     print(f"\nGuardado {SALIDA} ({len(df)} centros, {errores} errores)")
 
     base = pd.read_csv(IES_CSV, dtype={"CODIGO": str})
-    cols_nuevas = [c for c in df.columns if c != "CODIGO" and c not in base.columns]
+    cols_carac = [c for c in df.columns if c != "CODIGO"]
+    for c in cols_carac:
+        # reparacion: columna existente pero toda vacia (run fallido anterior) -> borrar y re-fusionar
+        if c in base.columns and base[c].isna().all():
+            base = base.drop(columns=[c])
+    cols_nuevas = [c for c in cols_carac if c not in base.columns]
     if cols_nuevas:
         base = base.merge(df[["CODIGO"] + cols_nuevas], on="CODIGO", how="left")
         base.to_csv(IES_CSV, index=False)
