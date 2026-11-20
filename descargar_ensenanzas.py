@@ -1,5 +1,5 @@
 """
-Paso 1b: enriquecer los IES con enseñanzas y turnos desde el Buscador de
+Paso 1b: enriquecer los IES con ensenanzas y turnos desde el Buscador de
 centros de la Comunidad de Madrid (Servicio Web a Padres de Alumnos).
 Para cada CODIGO descarga su ficha (MostrarFichaCentro.icm?cdCentro=...) y
 extrae: ESO, Bachillerato, FP, vespertino, nocturno, bilingue, jornada.
@@ -18,7 +18,7 @@ import pandas as pd
 FICHA = "https://gestiona.comunidad.madrid/wpad_pub/run/j/MostrarFichaCentro.icm"
 IES_CSV = "ies_publicos_madrid.csv"
 SALIDA = "ies_caracteristicas.csv"
-ESPERA_S = 0.25          # cortesia con el servidor (344 centros ~ 3-4 min)
+ESPERA_S = 0.25
 
 def _sesion():
     s = requests.Session()
@@ -47,8 +47,6 @@ def _marcado(seccion_html, patron):
     return False
 
 def extraer_caracteristicas(html):
-    """Extrae las caracteristicas de la ficha de un centro. Devuelve un dict."""
-    # --- tabla ETAPAS EDUCATIVAS (hasta OPCIONES LINGUISTICAS) ---
     etapas = _seccion(html, "ETAPAS EDUCATIVAS", "OPCIONES LING")
     filas = _filas(etapas)
     texto = _texto(etapas)
@@ -62,7 +60,6 @@ def extraer_caracteristicas(html):
     modalidades_bach = [f.strip() for f in filas
                         if re.search(r"Ciencias y Tecnología|Humanidades|Artes|General", f)]
 
-    # --- jornada del centro (checkbox; 'checked' solo visible en HTML crudo) ---
     jornada = _seccion(html, r"Jornada:?", "Integración|ADSCRIPCIÓN")
     dividida = _marcado(jornada, "dividida")
     continuada = _marcado(jornada, "continuada")
@@ -81,7 +78,10 @@ def extraer_caracteristicas(html):
 
 def procesar(todos=False):
     ies = pd.read_csv(IES_CSV, dtype={"CODIGO": str})
-    previo = pd.read_csv(SALIDA, dtype={"CODIGO": str}) if not todos else None
+    try:
+        previo = pd.read_csv(SALIDA, dtype={"CODIGO": str}) if not todos else None
+    except FileNotFoundError:
+        previo = None
     hechos = set(previo["CODIGO"]) if previo is not None else set()
 
     sesion = _sesion()
@@ -105,14 +105,13 @@ def procesar(todos=False):
         resultados.append({"CODIGO": codigo, **caracteristicas})
         if n % 25 == 0:
             print(f"  {n}/{len(pendientes)} ...")
-            pd.DataFrame(resultados).to_csv(SALIDA, index=False)   # checkpoint
+            pd.DataFrame(resultados).to_csv(SALIDA, index=False)
         time.sleep(ESPERA_S)
 
     df = pd.DataFrame(resultados)
     df.to_csv(SALIDA, index=False)
     print(f"\nGuardado {SALIDA} ({len(df)} centros, {errores} errores)")
 
-    # --- fusion con ies_publicos_madrid.csv ---
     base = pd.read_csv(IES_CSV, dtype={"CODIGO": str})
     cols_nuevas = [c for c in df.columns if c != "CODIGO" and c not in base.columns]
     if cols_nuevas:
