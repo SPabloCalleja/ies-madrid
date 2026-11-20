@@ -25,7 +25,7 @@ print(f"Centros totales en el CSV (incluye históricos dados de baja): {len(df)}
 ies = df[
     df["TIPO_ABRV"].isin(["IES", "IESO"])
     & (df["TITULARIDAD"] == "PÚBLICO")
-    & (df["SITUACION"] == "ALTA")
+    & (df["SITUACIÓN"] == "ALTA")
 ].copy()
 print(f"IES públicos en situación ALTA: {len(ies)}")
 
