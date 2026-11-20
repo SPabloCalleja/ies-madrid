@@ -1,11 +1,8 @@
 """
-Paso 3 (v7): visualizador Streamlit del miniproyecto de IES.
-- Slider de minutos maximos hasta 3 h (por defecto 57)
-- Desplegable y contador sincronizados con los filtros
-- Clic en un IES del mapa carga su trayecto
-- Desglose por modo (min y km andando), tabla de tramos con badges, GPX
-- Boton en la barra lateral: Excel con todos los centros del filtro
-  (hojas: Centros, Rutas tramo a tramo, Resumen)
+Paso 3 (v8): visualizador Streamlit del miniproyecto de IES.
+v8: integra las caracteristicas del buscador (ESO/Bachillerato/FP, turno
+de tarde, bilingue, jornada) en metricas, popup, filtros y Excel.
+Requiere ejecutar antes: descargar_ensenanzas.py
 
 Requisitos: uv add streamlit streamlit-folium plotly openpyxl
 Ejecutar:   uv run streamlit run app_ies.py   (contenedor OTP arriba)
@@ -23,9 +20,9 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 # ============ CONFIGURACION ============
-DIRECCION_CASA = "C. de Fray José Cerdeiriña, 39, Madrid, Madrid"
+DIRECCION_CASA = "Parroquia de San Antonio Maria Zaccaria, 27, Calle Fuente del Tiro, Madrid"
 FECHA = "2026-11-24"
-HORA_LLEGADA = "08:00"
+HORA_LLEGADA = "08:30"
 IES_CSV = "ies_por_tiempo_otp.csv"
 OTP = "http://localhost:8080"
 # =======================================
@@ -58,6 +55,8 @@ ORDEN_CATEGORIAS = ["andando", "metro", "bus_urbano", "bus_interurbano", "cercan
 COLUMNAS_EXCEL = [
     ("CENTRO", "IES"),
     ("minutos", "minutos"),
+    ("tiene_bachillerato", "Bachillerato"),
+    ("vespertino", "turno tarde"),
     ("transbordos", "transbordos"),
     ("salida", "salida de casa"),
     ("espera_min", "espera (min)"),
@@ -67,6 +66,11 @@ COLUMNAS_EXCEL = [
     ("min_bus_interurbano", "min bus interurbano"),
     ("min_cercanias", "min cercanias"),
     ("min_metro_ligero", "min metro ligero"),
+    ("tiene_eso", "ESO"),
+    ("tiene_fp", "FP"),
+    ("nocturno", "nocturno"),
+    ("bilingue", "bilingue"),
+    ("jornada", "jornada"),
     ("MUNICIPIO", "municipio"),
     ("CALLE", "calle"),
     ("NUMERO", "numero"),
@@ -159,6 +163,28 @@ def ies_mas_cercano(vis, lat, lng, umbral_m=400):
         if dist < mejor_d:
             mejor, mejor_d = f["etiqueta"], dist
     return mejor if mejor_d <= umbral_m else None
+
+def resumen_ensenanzas(fila):
+    partes = []
+    if fila.get("tiene_eso"):
+        partes.append("ESO")
+    if fila.get("tiene_bachillerato"):
+        partes.append("Bach")
+    if fila.get("tiene_fp"):
+        partes.append("FP")
+    return " + ".join(partes) if partes else "-"
+
+def resumen_extra(fila):
+    detalles = []
+    if fila.get("jornada") and isinstance(fila["jornada"], str) and fila["jornada"] != "desconocida":
+        detalles.append(f"jornada {fila['jornada']}")
+    if fila.get("bilingue"):
+        detalles.append("bilingüe")
+    if fila.get("vespertino"):
+        detalles.append("turno tarde")
+    if fila.get("nocturno"):
+        detalles.append("nocturno")
+    return " · ".join(detalles) if detalles else ""
 
 @st.cache_data(show_spinner="Geocodificando la vivienda...")
 def geocodificar(direccion):
@@ -306,16 +332,23 @@ def main():
         st.markdown("### Filtros")
         max_min = st.slider("Minutos maximos", int(df["minutos"].min()), 180, 57, 5)
         solo_a_pie_ok = st.checkbox("Incluir los que van mejor a pie", True)
+        solo_bach = st.checkbox("Solo con Bachillerato", False,
+                                disabled="tiene_bachillerato" not in df.columns)
+        sin_tarde = st.checkbox("Excluir turno de tarde", False,
+                                disabled="vespertino" not in df.columns)
         sel_muni = st.multiselect("Municipios", sorted(df["MUNICIPIO"].unique()))
 
     vis = df[df["minutos"] <= max_min]
     if not solo_a_pie_ok:
         vis = vis[vis["nota"] != "a pie"]
+    if solo_bach and "tiene_bachillerato" in vis.columns:
+        vis = vis[vis["tiene_bachillerato"] == True]
+    if sin_tarde and "vespertino" in vis.columns:
+        vis = vis[~(vis["vespertino"] == True)]
     if sel_muni:
         vis = vis[vis["MUNICIPIO"].isin(sel_muni)]
     st.sidebar.success(f"**{len(vis)} centros** en el mapa")
 
-    # --- Exportar a Excel ---
     if st.sidebar.button("Generar Excel de los centros", type="primary", disabled=vis.empty):
         st.session_state["excel_bytes"] = generar_excel(casa, vis, max_min)
         st.session_state["excel_filtro"] = max_min
@@ -325,9 +358,6 @@ def main():
             file_name=f"ies_{max_min}min_{FECHA}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             help=f"Centros hasta {st.session_state.get('excel_filtro', max_min)} min, con rutas detalladas")
-    else:
-        st.sidebar.caption("El Excel pide a OTP el itinerario de cada centro visible "
-                           "(los ya consultados salen de cache); tarda un poco la primera vez.")
 
     opciones = vis["etiqueta"].tolist()
     if st.session_state.get("seleccion") not in set(opciones):
@@ -339,15 +369,19 @@ def main():
     d = vis[vis["etiqueta"] == etiqueta].iloc[0]
     it = pedir_itinerario(casa, (d["lat"], d["lon"]))
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Tiempo total", f"{d['minutos']} min")
     col2.metric("Transbordos", d["transbordos"])
     col3.metric("Salida de casa", d["salida"])
-
     if it:
         dsc, espera, km_andando = desglosar(it)
-        col4.metric("Esperas en paradas", f"{espera:.0f} min")
+        col4.metric("Esperas", f"{espera:.0f} min")
+    col5.metric("Ensenanzas", resumen_ensenanzas(d))
+    extra = resumen_extra(d)
+    if extra:
+        st.caption(extra)
 
+    if it:
         c_izq, c_der = st.columns([2, 3])
         with c_izq:
             st.subheader("Desglose por modo")
@@ -385,13 +419,18 @@ def main():
     mapa = folium.Map(location=[casa[0] + 0.02, casa[1]], zoom_start=12, tiles="OpenStreetMap")
     folium.Marker(casa, tooltip="Casa", icon=folium.Icon(color="black", icon="home")).add_to(mapa)
     for _, fila in vis.iterrows():
+        detalles = f"{fila['CENTRO']}<br>{fila['MUNICIPIO']}<br>"
+        detalles += f"{resumen_ensenanzas(fila)}"
+        extra_f = resumen_extra(fila)
+        if extra_f:
+            detalles += f"<br>{extra_f}"
+        detalles += (f"<br>{fila['minutos']} min · {fila['transbordos']} transbordos<br>"
+                     f"salida {fila['salida']} ({fila['nota']})")
         folium.CircleMarker(
             (fila["lat"], fila["lon"]), radius=6, color=escala(fila["minutos"]),
             fill=True, fill_opacity=0.9,
             tooltip="clic para cargar el trayecto",
-            popup=folium.Popup(f"{fila['CENTRO']}<br>{fila['MUNICIPIO']}<br>"
-                               f"{fila['minutos']} min · {fila['transbordos']} transbordos<br>"
-                               f"salida {fila['salida']} ({fila['nota']})", max_width=250),
+            popup=folium.Popup(detalles, max_width=280),
         ).add_to(mapa)
     escala.add_to(mapa)
 
