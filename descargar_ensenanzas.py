@@ -36,29 +36,37 @@ def _texto(html):
 def _filas(seccion_html):
     return [_texto(f) for f in re.findall(r"<tr[^>]*>(.*?)</tr>", seccion_html, re.S | re.I)]
 
-def _seccion(html, titulo, siguiente_patron):
-    """Toma desde la ULTIMA aparicion de 'titulo' (el menu superior de la pagina
-    tambien contiene los titulos y nos robaria el trozo) hasta 'siguiente_patron'."""
-    pos = html.upper().rfind(titulo.upper())
-    if pos == -1:
-        return ""
-    resto = html[pos:]
-    m = re.search(siguiente_patron, resto, re.I)
-    return resto[:m.start()] if m else resto
+def _tablas(html):
+    return re.findall(r"<table[^>]*>(.*?)</table>", html, re.S | re.I)
+
+def _ultima_tabla_con(html, patron):
+    """La ultima <table> de la pagina cuyo contenido contiene 'patron'. Anclar
+    por tabla (no por posicion de texto) evita que el menu superior o los
+    propios textos de opciones secuestren la extraccion."""
+    candidatas = [t for t in _tablas(html) if re.search(patron, t, re.I)]
+    return candidatas[-1] if candidatas else ""
+
+_CHECK = re.compile(r"checked|selected|<img[^>]*(ok|check|tick|verde)", re.I)
 
 def _marcado(seccion_html, patron):
-    """True si la CELDA que contiene 'patron' parece marcada (checkbox checked
-    o imagen de check dentro de esa misma celda)."""
+    """True si la opcion 'patron' parece marcada: la marca esta en su propia
+    celda, o en la celda INMEDIATAMENTE ANTERIOR y esa celda no contiene nada
+    mas que el checkbox. Asi no se 'sangra' una marca a la opcion vecina."""
     celdas = re.findall(r"<td[^>]*>(.*?)</td>", seccion_html, re.S | re.I)
-    for c in celdas:
-        if re.search(patron, c, re.I) and re.search(r"checked|selected|<img[^>]*(ok|check|tick|verde)", c, re.I):
-            return True
+    for i, c in enumerate(celdas):
+        if re.search(patron, c, re.I):
+            if _CHECK.search(c):
+                return True
+            if i > 0 and _CHECK.search(celdas[i - 1]):
+                resto = re.sub(r"<[^>]+>", "", celdas[i - 1]).replace("&nbsp;", " ").strip()
+                if not resto:
+                    return True
     return False
 
 def extraer_caracteristicas(html):
     if not html:
         raise ValueError("la ficha llego vacia (posible pagina de sesion/error)")
-    etapas = _seccion(html, "ETAPAS EDUCATIVAS", r"OPCIONES LING")
+    etapas = _ultima_tabla_con(html, "ETAPAS EDUCATIVAS")
     filas = _filas(etapas)
     texto = _texto(etapas)
 
@@ -71,7 +79,7 @@ def extraer_caracteristicas(html):
     modalidades_bach = [f.strip() for f in filas
                         if re.search(r"Ciencias y Tecnología|Humanidades|Artes|General", f)]
 
-    jornada_html = _seccion(html, "Jornada", r"(?:Integraci[oó]n|ADSCRIPCI)")
+    jornada_html = _ultima_tabla_con(html, "dividida")
     dividida = _marcado(jornada_html, "dividida")
     continuada = _marcado(jornada_html, "continuada")
     if dividida and not continuada:
