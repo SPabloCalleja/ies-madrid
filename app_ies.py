@@ -1,15 +1,16 @@
 """
-Paso 3 (v12): visualizador Streamlit del miniproyecto de centros de secundaria.
-v12:
-  - Barra lateral reordenada: arriba el numero de centros visibles y el
-    desplegable de centro; debajo los filtros agrupados (Trayecto / Centro /
-    Zona); abajo del todo el boton del Excel.
-  - Eliminado el filtro "los que van mejor a pie".
-  - Arreglados "Solo con Bachillerato" y "Excluir turno de tarde" (y el de
-    interurbanos): las columnas True/False llegaban del CSV como texto y las
-    comparaciones con == True nunca casaban. Ahora se normalizan a bool al cargar.
-  - Transbordos nunca negativos: los itinerarios 100% a pie daban -1 (tambien
-    se acota lo que ya haya en el CSV, asi no hace falta re-ejecutar la matriz).
+Paso 3 (v13): visualizador Streamlit del miniproyecto de centros de secundaria.
+v13:
+  - ARREGLADO el click en el mapa: la seleccion se escribe en session_state
+    ANTES de crear el selectbox (via clave auxiliar sel_deseado). Asignar
+    despues de crear el widget (v12) lanzaba StreamlitAPIException.
+  - ARREGLADOS los filtros de Bachillerato/turno tarde: si al CSV de la matriz
+    le faltan (o estan vacias) las columnas de caracteristicas (la matriz se
+    ejecuto antes que descargar_ensenanzas.py), la app se las trae del
+    catalogo ies_publicos_madrid.csv por CODIGO. Ya no importa el orden.
+  - Conteo visible de centros con Bachillerato / turno tarde junto a los filtros.
+v12: barra lateral reordenada (conteo+desplegable, filtros agrupados, Excel),
+     booleans normalizados, transbordos nunca negativos.
 Requisitos: uv add streamlit streamlit-folium plotly openpyxl
 Ejecutar:   uv run streamlit run app_ies.py   (contenedor OTP arriba)
 """
@@ -30,6 +31,7 @@ DIRECCION_CASA = "C. de Fray José Cerdeiriña, 39, Madrid"
 FECHA = "2026-11-24"
 HORA_LLEGADA = "08:00"          # debe coincidir con matriz_tiempos_otp.py
 IES_CSV = "ies_por_tiempo_otp.csv"
+CATALOGO_CSV = "ies_publicos_madrid.csv"
 OTP = "http://localhost:8080"
 # =======================================
 
@@ -168,7 +170,6 @@ def paradas_cercanias(itinerario):
     return total
 
 def transbordos_de(itinerario):
-    """Tramos de transporte menos 1; a pie (0 tramos) -> 0, nunca -1."""
     return max(0, sum(1 for l in itinerario["legs"] if l["mode"] != "WALK") - 1)
 
 def hora_local(epoch_s):
@@ -201,7 +202,6 @@ def ies_mas_cercano(vis, lat, lng, umbral_m=400):
     return mejor if mejor_d <= umbral_m else None
 
 def nombre_completo(fila):
-    """Nombre con el tipo de centro: 'IES Complutense', 'CEPA Las Rozas'..."""
     tipo = str(fila.get("TIPO_ABRV") or "").strip()
     nombre = str(fila.get("CENTRO") or "").strip()
     return f"{tipo} {nombre}".strip()
@@ -234,14 +234,37 @@ def _como_bool(x):
     return str(x).strip().lower() in ("true", "1", "verdadero")
 
 def normalizar_dataframe(df):
-    """Arregla lo que llega del CSV: booleans escritos como texto y los
-    transbordos -1 de itinerarios a pie generados por matrices antiguas."""
     for c in _COLS_BOOL:
         if c in df.columns:
             df[c] = df[c].map(_como_bool)
     for c in ("transbordos", "transbordos_sin_interurbanos"):
         if c in df.columns:
             df[c] = df[c].clip(lower=0)
+    return df
+
+def enriquecer_desde_catalogo(df):
+    """Si al CSV de la matriz le faltan (o estan vacias) las columnas de
+    caracteristicas de los centros, se traen del catalogo por CODIGO. La causa
+    tipica es ejecutar la matriz antes que descargar_ensenanzas.py; asi la app
+    deja de depender del orden de ejecucion de la cadena."""
+    campos = ("tiene_eso", "tiene_bachillerato", "tiene_fp", "vespertino",
+              "nocturno", "bilingue", "jornada")
+    if "CODIGO" not in df.columns:
+        return df
+    faltan = [c for c in campos if c not in df.columns or df[c].isna().all()]
+    if not faltan:
+        return df
+    try:
+        catalogo = pd.read_csv(CATALOGO_CSV, dtype={"CODIGO": str},
+                               usecols=lambda c: c == "CODIGO" or c in faltan)
+    except FileNotFoundError:
+        return df
+    if len(catalogo.columns) < 2:
+        return df
+    catalogo = catalogo.drop_duplicates(subset=["CODIGO"])
+    df = df.drop(columns=[c for c in faltan if c in df.columns]).copy()
+    df["CODIGO"] = df["CODIGO"].astype(str)
+    df = df.merge(catalogo, on="CODIGO", how="left")
     return df
 
 @st.cache_data(show_spinner="Geocodificando la vivienda...")
@@ -255,6 +278,7 @@ def geocodificar(direccion):
 @st.cache_data
 def cargar_ies():
     df = pd.read_csv(IES_CSV)
+    df = enriquecer_desde_catalogo(df)
     nombres = df.apply(nombre_completo, axis=1)
     df["etiqueta"] = nombres + " (" + df["MUNICIPIO"] + ")"
     df = normalizar_dataframe(df)
@@ -420,9 +444,6 @@ def main():
         st.error("No encuentro ies_por_tiempo_otp.csv: ejecuta antes matriz_tiempos_otp.py")
         return
 
-    # los valores de filtro se leen de session_state: al cambiar uno, ya esta
-    # actualizado antes de renderizar los widgets, asi el conteo de arriba
-    # refleja siempre el filtro nuevo sin reruns extra
     for clave, defecto in DEFECTOS_FILTROS.items():
         if clave not in st.session_state:
             st.session_state[clave] = defecto
@@ -430,10 +451,15 @@ def main():
     vis = aplicar_filtros(df, f)
 
     # ============ 1) arriba: numero de centros y desplegable ============
+    # OJO: la seleccion del mapa se aplica via sel_deseado ANTES de crear el
+    # selectbox: asignar st.session_state de un widget despues de crearlo
+    # lanza StreamlitAPIException (el bug del click en v12)
     with st.sidebar:
         st.markdown("### Centros")
         st.metric("Visibles en el mapa", len(vis))
         opciones = vis["etiqueta"].tolist() if not vis.empty else df["etiqueta"].tolist()[:1]
+        if st.session_state.get("sel_deseado") in set(opciones):
+            st.session_state["sel_centro"] = st.session_state.pop("sel_deseado")
         if st.session_state.get("sel_centro") not in set(opciones):
             st.session_state["sel_centro"] = opciones[0]
         etiqueta = st.selectbox("Centro a detallar", opciones, key="sel_centro")
@@ -450,11 +476,17 @@ def main():
                         help="Paradas de Renfe Cercanías del trayecto (subida + intermedias + bajada). "
                              "Los centros cuyo trayecto supere este número no se muestran.")
         st.markdown("**Centro**")
-        if {"tiene_bachillerato", "vespertino"}.issubset(df.columns):
+        if "tiene_bachillerato" in df.columns:
             st.checkbox("Solo con Bachillerato", key="f_bach")
+        if "vespertino" in df.columns:
             st.checkbox("Excluir turno de tarde", key="f_tarde")
-        else:
-            st.info("Ejecuta descargar_ensenanzas.py para activar los filtros de enseñanzas y turnos")
+        if "tiene_bachillerato" not in df.columns and "vespertino" not in df.columns:
+            st.info("Faltan las columnas de enseñanzas: ejecuta descargar_ensenanzas.py "
+                    "(y luego la matriz para propagarlas, aunque la app intenta traerlas del catálogo)")
+        if "tiene_bachillerato" in df.columns:
+            st.caption(f"{int(df['tiene_bachillerato'].sum())} centros con Bachillerato en total"
+                       + (f" · {int(df['vespertino'].sum())} con turno tarde"
+                          if "vespertino" in df.columns else ""))
         if "TIPO_ABRV" in df.columns:
             st.multiselect("Tipos de centro", sorted(df["TIPO_ABRV"].dropna().unique()), key="f_tipo")
         st.markdown("**Zona**")
@@ -579,7 +611,9 @@ def main():
             st.session_state["click_previo"] = clave
             cercano = ies_mas_cercano(vis, click["lat"], click["lng"])
             if cercano and cercano != etiqueta:
-                st.session_state["sel_centro"] = cercano
+                # sel_deseado NO es clave de widget: asignable aqui sin problema.
+                # El selectbox la aplicara en la siguiente ejecucion, antes de crearse.
+                st.session_state["sel_deseado"] = cercano
                 try:
                     st.rerun()
                 except AttributeError:
