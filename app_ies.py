@@ -1,9 +1,11 @@
 """
-Paso 3 (v8): visualizador Streamlit del miniproyecto de IES.
-v8: integra las caracteristicas del buscador (ESO/Bachillerato/FP, turno
-de tarde, bilingue, jornada) en metricas, popup, filtros y Excel.
-Requiere ejecutar antes: descargar_ensenanzas.py
-
+Paso 3 (v9): visualizador Streamlit del miniproyecto de IES.
+v9:
+  - Nueva direccion de origen (C. de Fray José Cerdeiriña, 39, Madrid)
+  - Puntos del mapa con borde negro (los colores claros no se veian)
+  - Filtro por numero maximo de paradas de Renfe Cercanias del trayecto
+    (numerico, por defecto 5). Cuenta subida + intermedias + bajada de cada
+    tramo de cercanias, usando intermediateStops de la API GraphQL de OTP.
 Requisitos: uv add streamlit streamlit-folium plotly openpyxl
 Ejecutar:   uv run streamlit run app_ies.py   (contenedor OTP arriba)
 """
@@ -20,11 +22,12 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 # ============ CONFIGURACION ============
-DIRECCION_CASA = "Parroquia de San Antonio Maria Zaccaria, 27, Calle Fuente del Tiro, Madrid"
+DIRECCION_CASA = "C. de Fray José Cerdeiriña, 39, Madrid"
 FECHA = "2026-11-24"
 HORA_LLEGADA = "08:30"
 IES_CSV = "ies_por_tiempo_otp.csv"
 OTP = "http://localhost:8080"
+PARADAS_CERCANIAS_DEFECTO = 5
 # =======================================
 
 QUERY_MAPA = """query Plan($from: InputCoordinates!, $to: InputCoordinates!, $arriveBy: Boolean!) {
@@ -36,6 +39,7 @@ QUERY_MAPA = """query Plan($from: InputCoordinates!, $to: InputCoordinates!, $ar
         mode startTime endTime distance
         route { shortName agency { name } }
         from { name } to { name }
+        intermediateStops { name }
         legGeometry { points }
       }
     }
@@ -60,6 +64,7 @@ COLUMNAS_EXCEL = [
     ("transbordos", "transbordos"),
     ("salida", "salida de casa"),
     ("espera_min", "espera (min)"),
+    ("paradas_cercanias", "paradas cercanias"),
     ("min_andando", "min andando"),
     ("min_metro", "min metro"),
     ("min_bus_urbano", "min bus urbano"),
@@ -134,6 +139,15 @@ def clasificar_tramo(leg):
             return "bus_urbano"
         return "bus_interurbano"
     return "otro"
+
+def paradas_cercanias(itinerario):
+    """Paradas de Renfe Cercanias del trayecto: subida + intermedias + bajada
+    de cada tramo de cercanias (los tramos de metro/bus no cuentan)."""
+    total = 0
+    for leg in (itinerario or {}).get("legs", []):
+        if clasificar_tramo(leg) == "cercanias":
+            total += len(leg.get("intermediateStops") or []) + 2
+    return total
 
 def hora_local(epoch_s):
     from zoneinfo import ZoneInfo
@@ -331,6 +345,11 @@ def main():
     with st.sidebar:
         st.markdown("### Filtros")
         max_min = st.slider("Minutos maximos", int(df["minutos"].min()), 180, 57, 5)
+        max_paradas = st.number_input(
+            "Max. paradas de Cercanias en el trayecto",
+            min_value=0, max_value=60, value=PARADAS_CERCANIAS_DEFECTO,
+            help="Paradas de Renfe Cercanias del trayecto (subida + intermedias + bajada). "
+                 "Los centros cuyo trayecto supere este numero no se muestran.")
         solo_a_pie_ok = st.checkbox("Incluir los que van mejor a pie", True)
         solo_bach = st.checkbox("Solo con Bachillerato", False,
                                 disabled="tiene_bachillerato" not in df.columns)
@@ -347,6 +366,21 @@ def main():
         vis = vis[~(vis["vespertino"] == True)]
     if sel_muni:
         vis = vis[vis["MUNICIPIO"].isin(sel_muni)]
+
+    # --- filtro de paradas de cercanias: itinerario de cada centro visible ---
+    if not vis.empty:
+        barra = st.progress(0.0, text="Calculando paradas de Cercanias de los trayectos...")
+        registros = []
+        for i, (_, fila) in enumerate(vis.iterrows()):
+            it = pedir_itinerario(casa, (fila["lat"], fila["lon"]))
+            fila = fila.copy()
+            fila["paradas_cercanias"] = paradas_cercanias(it) if it else None
+            registros.append(fila)
+            barra.progress((i + 1) / len(vis),
+                           text=f"Paradas de Cercanias: {i + 1}/{len(vis)} (la proxima vez es instantaneo)")
+        barra.empty()
+        vis = pd.DataFrame(registros)
+        vis = vis[vis["paradas_cercanias"].isna() | (vis["paradas_cercanias"] <= max_paradas)]
     st.sidebar.success(f"**{len(vis)} centros** en el mapa")
 
     if st.sidebar.button("Generar Excel de los centros", type="primary", disabled=vis.empty):
@@ -359,14 +393,14 @@ def main():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             help=f"Centros hasta {st.session_state.get('excel_filtro', max_min)} min, con rutas detalladas")
 
-    opciones = vis["etiqueta"].tolist()
+    opciones = vis["etiqueta"].tolist() if not vis.empty else df["etiqueta"].tolist()[:1]
     if st.session_state.get("seleccion") not in set(opciones):
         st.session_state["seleccion"] = opciones[0]
     etiqueta = st.sidebar.selectbox("IES a detallar", opciones,
                                     index=opciones.index(st.session_state["seleccion"]))
     st.session_state["seleccion"] = etiqueta
 
-    d = vis[vis["etiqueta"] == etiqueta].iloc[0]
+    d = vis[vis["etiqueta"] == etiqueta].iloc[0] if not vis.empty else df.iloc[0]
     it = pedir_itinerario(casa, (d["lat"], d["lon"]))
 
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -378,6 +412,9 @@ def main():
         col4.metric("Esperas", f"{espera:.0f} min")
     col5.metric("Ensenanzas", resumen_ensenanzas(d))
     extra = resumen_extra(d)
+    pc = paradas_cercanias(it) if it else None
+    if pc is not None:
+        extra += (f"{'; ' if extra else ''}Cercanías: {pc} paradas")
     if extra:
         st.caption(extra)
 
@@ -410,8 +447,8 @@ def main():
                            file_name=f"trayecto_{d['CENTRO'].replace(' ', '_')}.gpx",
                            mime="application/gpx")
 
-    st.markdown(f"Mostrando **{len(vis)} centros** en el mapa (hasta {max_min} min) · "
-                f"pincha en uno para cargar su trayecto")
+    st.markdown(f"Mostrando **{len(vis)} centros** en el mapa (hasta {max_min} min, "
+                f"max {max_paradas} paradas de Cercanias) · pincha en uno para cargar su trayecto")
     escala = branca.colormap.LinearColormap(
         ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"],
         vmin=int(df["minutos"].min()), vmax=int(df["minutos"].max()),
@@ -427,8 +464,10 @@ def main():
         detalles += (f"<br>{fila['minutos']} min · {fila['transbordos']} transbordos<br>"
                      f"salida {fila['salida']} ({fila['nota']})")
         folium.CircleMarker(
-            (fila["lat"], fila["lon"]), radius=6, color=escala(fila["minutos"]),
-            fill=True, fill_opacity=0.9,
+            (fila["lat"], fila["lon"]), radius=6,
+            color="#000000", weight=1.5,
+            stroke=True,
+            fill=True, fill_color=escala(fila["minutos"]), fill_opacity=0.95,
             tooltip="clic para cargar el trayecto",
             popup=folium.Popup(detalles, max_width=280),
         ).add_to(mapa)
