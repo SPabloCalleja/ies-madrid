@@ -1,7 +1,9 @@
 """
 Paso 3 (v15): visualizador Streamlit del miniproyecto de centros de secundaria.
-v15: nuevo filtro "Minutos andando maximos" (defecto 23, tope 45), junto al de
-     minutos totales; usa el min_andando del desglose que calcula la matriz.
+v15: filtro "Minutos andando maximos" (defecto 23, tope 45) junto al de minutos
+     totales, sobre el min_andando del desglose de la matriz.
+     Parche: el boton del Excel llamaba como metodo una propiedad de pandas
+     (vis.empty); ahora usa len(vis) == 0.
 v14: width="stretch" (adios warning), menu lateral compacto con secciones,
      panel central con el nombre del centro protagonista, mapa 520 px.
 v13: click del mapa arreglado (sel_deseado), caracteristicas auto-traidas del
@@ -542,7 +544,7 @@ def main():
     # ============ 3) abajo del todo: Excel ============
     with st.sidebar:
         _seccion("Exportar", "⬇️", "#d84b3b")
-        if st.button("Generar Excel de los centros", type="primary", disabled=vis.empty()):
+        if st.button("Generar Excel de los centros", type="primary", disabled=len(vis) == 0):
             st.session_state["excel_bytes"] = generar_excel(casa, vis, f["f_max_min"])
             st.session_state["excel_filtro"] = f["f_max_min"]
         if st.session_state.get("excel_bytes"):
