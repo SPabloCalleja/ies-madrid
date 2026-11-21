@@ -1,11 +1,10 @@
 """
-Paso 3 (v9): visualizador Streamlit del miniproyecto de IES.
-v9:
-  - Nueva direccion de origen (C. de Fray José Cerdeiriña, 39, Madrid)
-  - Puntos del mapa con borde negro (los colores claros no se veian)
-  - Filtro por numero maximo de paradas de Renfe Cercanias del trayecto
-    (numerico, por defecto 5). Cuenta subida + intermedias + bajada de cada
-    tramo de cercanias, usando intermediateStops de la API GraphQL de OTP.
+Paso 3 (v11): visualizador Streamlit del miniproyecto de centros de secundaria.
+v11: nombres completos con el tipo de centro (IES, CEPA, CP INF-PRI-SEC...)
+     en el selector, popup, titulo del trayecto y Excel (columna "tipo"),
+     y filtro lateral por tipo de centro.
+v10: paradas de Cercanias del CSV (batch), filtro "Excluir buses interurbanos"
+     usando minutos_sin_interurbanos, desglose con paradas de cercanias.
 Requisitos: uv add streamlit streamlit-folium plotly openpyxl
 Ejecutar:   uv run streamlit run app_ies.py   (contenedor OTP arriba)
 """
@@ -24,7 +23,7 @@ from streamlit_folium import st_folium
 # ============ CONFIGURACION ============
 DIRECCION_CASA = "C. de Fray José Cerdeiriña, 39, Madrid"
 FECHA = "2026-11-24"
-HORA_LLEGADA = "08:30"
+HORA_LLEGADA = "08:00"          # debe coincidir con matriz_tiempos_otp.py
 IES_CSV = "ies_por_tiempo_otp.csv"
 OTP = "http://localhost:8080"
 PARADAS_CERCANIAS_DEFECTO = 5
@@ -32,12 +31,14 @@ PARADAS_CERCANIAS_DEFECTO = 5
 
 QUERY_MAPA = """query Plan($from: InputCoordinates!, $to: InputCoordinates!, $arriveBy: Boolean!) {
   plan(from: $from, to: $to, date: \"%(fecha)s\", time: \"%(hora)s\",
-       arriveBy: $arriveBy, transportModes: [{mode: TRANSIT}, {mode: WALK}], numItineraries: 3) {
+       arriveBy: $arriveBy,
+       %(ban)s
+       transportModes: [{mode: TRANSIT}, {mode: WALK}], numItineraries: 3) {
     itineraries {
       duration startTime endTime
       legs {
         mode startTime endTime distance
-        route { shortName agency { name } }
+        route { shortName agency { gtfsId name } }
         from { name } to { name }
         intermediateStops { name }
         legGeometry { points }
@@ -58,13 +59,16 @@ ORDEN_CATEGORIAS = ["andando", "metro", "bus_urbano", "bus_interurbano", "cercan
 
 COLUMNAS_EXCEL = [
     ("CENTRO", "IES"),
+    ("TIPO_ABRV", "tipo"),
     ("minutos", "minutos"),
+    ("minutos_sin_interurbanos", "min sin interurbano"),
     ("tiene_bachillerato", "Bachillerato"),
     ("vespertino", "turno tarde"),
     ("transbordos", "transbordos"),
     ("salida", "salida de casa"),
     ("espera_min", "espera (min)"),
     ("paradas_cercanias", "paradas cercanias"),
+    ("usa_interurbano", "usa interurbano"),
     ("min_andando", "min andando"),
     ("min_metro", "min metro"),
     ("min_bus_urbano", "min bus urbano"),
@@ -141,8 +145,6 @@ def clasificar_tramo(leg):
     return "otro"
 
 def paradas_cercanias(itinerario):
-    """Paradas de Renfe Cercanias del trayecto: subida + intermedias + bajada
-    de cada tramo de cercanias (los tramos de metro/bus no cuentan)."""
     total = 0
     for leg in (itinerario or {}).get("legs", []):
         if clasificar_tramo(leg) == "cercanias":
@@ -178,6 +180,12 @@ def ies_mas_cercano(vis, lat, lng, umbral_m=400):
             mejor, mejor_d = f["etiqueta"], dist
     return mejor if mejor_d <= umbral_m else None
 
+def nombre_completo(fila):
+    """Nombre con el tipo de centro: 'IES Complutense', 'CEPA Las Rozas'..."""
+    tipo = str(fila.get("TIPO_ABRV") or "").strip()
+    nombre = str(fila.get("CENTRO") or "").strip()
+    return f"{tipo} {nombre}".strip()
+
 def resumen_ensenanzas(fila):
     partes = []
     if fila.get("tiene_eso"):
@@ -211,12 +219,14 @@ def geocodificar(direccion):
 @st.cache_data
 def cargar_ies():
     df = pd.read_csv(IES_CSV)
-    df["etiqueta"] = df["CENTRO"] + " (" + df["MUNICIPIO"] + ")"
+    nombres = df.apply(nombre_completo, axis=1)
+    df["etiqueta"] = nombres + " (" + df["MUNICIPIO"] + ")"
     return df.sort_values("minutos")
 
 @st.cache_data(ttl=600, show_spinner=False)
-def pedir_itinerario(casa, destino):
-    body = {"query": QUERY_MAPA % {"fecha": FECHA, "hora": HORA_LLEGADA + ":00"},
+def pedir_itinerario(casa, destino, agencias_ban=()):
+    ban = 'banned: {agencies: "%s"},' % ",".join(sorted(agencias_ban)) if agencias_ban else ""
+    body = {"query": QUERY_MAPA % {"fecha": FECHA, "hora": HORA_LLEGADA + ":00", "ban": ban},
             "variables": {"from": {"lat": casa[0], "lon": casa[1]},
                           "to": {"lat": destino[0], "lon": destino[1]}, "arriveBy": True}}
     r = requests.post(f"{OTP}/otp/gtfs/v1", json=body, timeout=120)
@@ -226,13 +236,29 @@ def pedir_itinerario(casa, destino):
     its = ((data.get("data") or {}).get("plan") or {}).get("itineraries") or []
     return normalizar_itinerario(min(its, key=lambda i: i["duration"])) if its else None
 
+def aplicar_filtro_interurbanos(vis, activo):
+    if not activo or "usa_interurbano" not in vis.columns:
+        return vis
+    vis = vis[(vis["usa_interurbano"] != True) | vis["minutos_sin_interurbanos"].notna()].copy()
+    mask = vis["usa_interurbano"] == True
+    vis.loc[mask, "minutos"] = vis.loc[mask, "minutos_sin_interurbanos"]
+    return vis.sort_values("minutos")
+
+def vetos_de(fila, activo):
+    if not activo:
+        return ()
+    crudo = fila.get("agencias_interurbanas")
+    if not isinstance(crudo, str) or not crudo:
+        return ()
+    return tuple(x for x in crudo.split(",") if x)
+
 def filas_rutas_de(itinerario, centro, min_total):
     filas = []
     prev_fin = None
     for leg in itinerario["legs"]:
         espera = max(0, (leg["startTime"] - prev_fin) / 60) if prev_fin else 0
         filas.append({
-            "IES": centro, "minutos total": min_total,
+            "centro": centro, "minutos total": min_total,
             "modo": ETIQUETA_MODO[clasificar_tramo(leg)],
             "linea": (leg.get("route") or {}).get("shortName") or "",
             "sale": hora_local(leg["startTime"]), "llega": hora_local(leg["endTime"]),
@@ -254,9 +280,9 @@ def generar_excel(casa, vis, max_min):
     todas_rutas = []
     barra = st.progress(0.0, text="Pidiendo itinerarios a OTP...")
     for i, (_, fila) in enumerate(vis.iterrows()):
-        it = pedir_itinerario(casa, (fila["lat"], fila["lon"]))
+        it = pedir_itinerario(casa, (fila["lat"], fila["lon"]), vetos_de(fila, True))
         if it:
-            todas_rutas += filas_rutas_de(it, fila["CENTRO"], fila["minutos"])
+            todas_rutas += filas_rutas_de(it, nombre_completo(fila), fila["minutos"])
         barra.progress((i + 1) / len(vis), text=f"Itinerarios: {i + 1}/{len(vis)}")
     rutas = pd.DataFrame(todas_rutas)
 
@@ -333,7 +359,7 @@ def gpx_de_itinerario(it):
 
 def main():
     st.set_page_config(layout="wide")
-    st.title("IES publicos de Madrid por tiempo de transporte")
+    st.title("Centros publicos de secundaria y bachillerato por tiempo de transporte")
     st.caption(f"Desde la vivienda, llegando a las {HORA_LLEGADA} ({FECHA}, planificacion GTFS, sin tiempo real)")
 
     casa = geocodificar(DIRECCION_CASA)
@@ -344,6 +370,10 @@ def main():
 
     with st.sidebar:
         st.markdown("### Filtros")
+        excluir_interurbanos = st.checkbox(
+            "Excluir buses interurbanos", True,
+            help="Si el mejor trayecto usa bus interurbano, se usa la alternativa sin ellos "
+                 "(precalculada, mas lenta). Los centros sin alternativa desaparecen.")
         max_min = st.slider("Minutos maximos", int(df["minutos"].min()), 180, 57, 5)
         max_paradas = st.number_input(
             "Max. paradas de Cercanias en el trayecto",
@@ -356,8 +386,11 @@ def main():
         sin_tarde = st.checkbox("Excluir turno de tarde", False,
                                 disabled="vespertino" not in df.columns)
         sel_muni = st.multiselect("Municipios", sorted(df["MUNICIPIO"].unique()))
+        sel_tipo = st.multiselect("Tipos de centro", sorted(df["TIPO_ABRV"].dropna().unique())
+                                   if "TIPO_ABRV" in df.columns else [])
 
-    vis = df[df["minutos"] <= max_min]
+    vis = aplicar_filtro_interurbanos(df, excluir_interurbanos)
+    vis = vis[vis["minutos"] <= max_min]
     if not solo_a_pie_ok:
         vis = vis[vis["nota"] != "a pie"]
     if solo_bach and "tiene_bachillerato" in vis.columns:
@@ -366,20 +399,9 @@ def main():
         vis = vis[~(vis["vespertino"] == True)]
     if sel_muni:
         vis = vis[vis["MUNICIPIO"].isin(sel_muni)]
-
-    # --- filtro de paradas de cercanias: itinerario de cada centro visible ---
-    if not vis.empty:
-        barra = st.progress(0.0, text="Calculando paradas de Cercanias de los trayectos...")
-        registros = []
-        for i, (_, fila) in enumerate(vis.iterrows()):
-            it = pedir_itinerario(casa, (fila["lat"], fila["lon"]))
-            fila = fila.copy()
-            fila["paradas_cercanias"] = paradas_cercanias(it) if it else None
-            registros.append(fila)
-            barra.progress((i + 1) / len(vis),
-                           text=f"Paradas de Cercanias: {i + 1}/{len(vis)} (la proxima vez es instantaneo)")
-        barra.empty()
-        vis = pd.DataFrame(registros)
+    if sel_tipo and "TIPO_ABRV" in vis.columns:
+        vis = vis[vis["TIPO_ABRV"].isin(sel_tipo)]
+    if "paradas_cercanias" in vis.columns:
         vis = vis[vis["paradas_cercanias"].isna() | (vis["paradas_cercanias"] <= max_paradas)]
     st.sidebar.success(f"**{len(vis)} centros** en el mapa")
 
@@ -389,27 +411,30 @@ def main():
     if st.session_state.get("excel_bytes"):
         st.sidebar.download_button(
             "Descargar Excel", st.session_state["excel_bytes"],
-            file_name=f"ies_{max_min}min_{FECHA}.xlsx",
+            file_name=f"centros_{max_min}min_{FECHA}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             help=f"Centros hasta {st.session_state.get('excel_filtro', max_min)} min, con rutas detalladas")
 
     opciones = vis["etiqueta"].tolist() if not vis.empty else df["etiqueta"].tolist()[:1]
     if st.session_state.get("seleccion") not in set(opciones):
         st.session_state["seleccion"] = opciones[0]
-    etiqueta = st.sidebar.selectbox("IES a detallar", opciones,
+    etiqueta = st.sidebar.selectbox("Centro a detallar", opciones,
                                     index=opciones.index(st.session_state["seleccion"]))
     st.session_state["seleccion"] = etiqueta
 
     d = vis[vis["etiqueta"] == etiqueta].iloc[0] if not vis.empty else df.iloc[0]
-    it = pedir_itinerario(casa, (d["lat"], d["lon"]))
+    it = pedir_itinerario(casa, (d["lat"], d["lon"]), vetos_de(d, excluir_interurbanos))
 
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Tiempo total", f"{d['minutos']} min")
-    col2.metric("Transbordos", d["transbordos"])
-    col3.metric("Salida de casa", d["salida"])
     if it:
         dsc, espera, km_andando = desglosar(it)
+        col2.metric("Transbordos", sum(1 for l in it["legs"] if l["mode"] != "WALK") - 1)
+        col3.metric("Salida de casa", hora_local(it["startTime"]))
         col4.metric("Esperas", f"{espera:.0f} min")
+    else:
+        col2.metric("Transbordos", d["transbordos"])
+        col3.metric("Salida de casa", d["salida"])
     col5.metric("Ensenanzas", resumen_ensenanzas(d))
     extra = resumen_extra(d)
     pc = paradas_cercanias(it) if it else None
@@ -428,6 +453,8 @@ def main():
                     etiqueta_txt = ETIQUETA_MODO[c]
                     if c == "andando":
                         etiqueta_txt += f" ({km_andando:.1f} km)"
+                    if c == "cercanias" and pc:
+                        etiqueta_txt += f" ({pc} paradas)"
                     filas.append({"modo": ETIQUETA_MODO[c], "etiqueta": etiqueta_txt,
                                   "minutos": round(dsc[c])})
             if espera > 0.5:
@@ -441,22 +468,25 @@ def main():
             fig.update_yaxes(title=None)
             st.plotly_chart(fig, use_container_width=True)
         with c_der:
-            st.subheader(f"Trayecto completo: {d['CENTRO']}")
+            st.subheader(f"Trayecto completo: {nombre_completo(d)}")
             st.markdown(tabla_tramos_html(it), unsafe_allow_html=True)
         st.download_button("Descargar trayecto (GPX)", gpx_de_itinerario(it),
-                           file_name=f"trayecto_{d['CENTRO'].replace(' ', '_')}.gpx",
+                           file_name=f"trayecto_{nombre_completo(d).replace(' ', '_')}.gpx",
                            mime="application/gpx")
 
     st.markdown(f"Mostrando **{len(vis)} centros** en el mapa (hasta {max_min} min, "
-                f"max {max_paradas} paradas de Cercanias) · pincha en uno para cargar su trayecto")
+                f"max {max_paradas} paradas de Cercanias"
+                + (", sin buses interurbanos" if excluir_interurbanos else "") +
+                ") · pincha en uno para cargar su trayecto")
+    vmax = int(max(df["minutos"].max(), vis["minutos"].max() if not vis.empty else 0))
     escala = branca.colormap.LinearColormap(
         ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"],
-        vmin=int(df["minutos"].min()), vmax=int(df["minutos"].max()),
+        vmin=int(df["minutos"].min()), vmax=vmax,
         caption="minutos de viaje (llegada %s)" % HORA_LLEGADA)
     mapa = folium.Map(location=[casa[0] + 0.02, casa[1]], zoom_start=12, tiles="OpenStreetMap")
     folium.Marker(casa, tooltip="Casa", icon=folium.Icon(color="black", icon="home")).add_to(mapa)
     for _, fila in vis.iterrows():
-        detalles = f"{fila['CENTRO']}<br>{fila['MUNICIPIO']}<br>"
+        detalles = f"{nombre_completo(fila)}<br>{fila['MUNICIPIO']}<br>"
         detalles += f"{resumen_ensenanzas(fila)}"
         extra_f = resumen_extra(fila)
         if extra_f:

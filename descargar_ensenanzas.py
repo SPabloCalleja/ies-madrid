@@ -1,14 +1,17 @@
 """
-Paso 1b (v6): enriquecer los IES con ensenanzas y turnos desde el Buscador de
-centros de la Comunidad de Madrid (Servicio Web a Padres de Alumnos).
+Paso 1b (v6): enriquecer los centros con ensenanzas y turnos desde el Buscador
+de centros de la Comunidad de Madrid (Servicio Web a Padres de Alumnos).
+Para cada CODIGO descarga su ficha (MostrarFichaCentro.icm?cdCentro=...) y
+extrae: ESO, Bachillerato, FP, vespertino, nocturno, bilingue, jornada.
+
 v6: extraccion por FILAS con filtros de longitud. Las paginas .icm usan tablas
     anidadas; el enfoque anterior (ultima tabla que contiene X) se tragaba
     fragmentos gigantes con otras secciones y daba "todos con Bach+FP".
-    La jornada ahora se busca en toda la pagina (las etiquetas 'dividida'/
-    'continuada' solo aparecen en esa tabla), con celdas adyacentes.
+    La jornada se busca en toda la pagina (las etiquetas 'dividida'/'continuada'
+    solo aparecen en esa tabla), con logica de celdas adyacentes.
 
 Fuente: https://gestiona.comunidad.madrid/wpad_pub/run/j/MostrarFichaCentro.icm
-Uso: uv run descargar_ensenanzas.py --todos   (rehace los 344)
+Uso: uv run descargar_ensenanzas.py --todos   (rehace todos los centros)
      uv run descargar_ensenanzas.py          (solo los pendientes/fallidos)
 """
 import re
