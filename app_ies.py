@@ -1,16 +1,16 @@
 """
-Paso 3 (v13): visualizador Streamlit del miniproyecto de centros de secundaria.
-v13:
-  - ARREGLADO el click en el mapa: la seleccion se escribe en session_state
-    ANTES de crear el selectbox (via clave auxiliar sel_deseado). Asignar
-    despues de crear el widget (v12) lanzaba StreamlitAPIException.
-  - ARREGLADOS los filtros de Bachillerato/turno tarde: si al CSV de la matriz
-    le faltan (o estan vacias) las columnas de caracteristicas (la matriz se
-    ejecuto antes que descargar_ensenanzas.py), la app se las trae del
-    catalogo ies_publicos_madrid.csv por CODIGO. Ya no importa el orden.
-  - Conteo visible de centros con Bachillerato / turno tarde junto a los filtros.
-v12: barra lateral reordenada (conteo+desplegable, filtros agrupados, Excel),
-     booleans normalizados, transbordos nunca negativos.
+Paso 3 (v14): visualizador Streamlit del miniproyecto de centros de secundaria.
+v14:
+  - use_container_width deprecado: se usa width="stretch" (con deteccion de
+    version y fallback para Streamlit viejo). Adios al warning.
+  - Menu lateral compacto: contador en una sola linea (badge con degradado),
+    secciones con cabeceras de color y separadores; selectbox justo debajo.
+  - Panel central: sin titulo gigante; cabecera ligera de una linea, nombre
+    del centro destacado arriba (con color) y barra separadora antes de las
+    metricas. Los subtitulos de desglose/trayecto mas discretos.
+  - Mapa algo mas pequeno (520 px).
+v13: click del mapa arreglado (sel_deseado), columnas de caracteristicas
+     auto-traidas del catalogo, filtros Bachillerato/tarde arreglados.
 Requisitos: uv add streamlit streamlit-folium plotly openpyxl
 Ejecutar:   uv run streamlit run app_ies.py   (contenedor OTP arriba)
 """
@@ -33,6 +33,7 @@ HORA_LLEGADA = "08:00"          # debe coincidir con matriz_tiempos_otp.py
 IES_CSV = "ies_por_tiempo_otp.csv"
 CATALOGO_CSV = "ies_publicos_madrid.csv"
 OTP = "http://localhost:8080"
+ALTURA_MAPA = 520
 # =======================================
 
 QUERY_MAPA = """query Plan($from: InputCoordinates!, $to: InputCoordinates!, $arriveBy: Boolean!) {
@@ -110,6 +111,50 @@ COLUMNAS_EXCEL = [
     ("lon", "lon"),
     ("nota", "nota"),
 ]
+
+# Streamlit >= 1.49 depreca use_container_width en favor de width="stretch"
+def _version_st():
+    try:
+        return tuple(int(p) for p in st.__version__.split(".")[:2])
+    except (AttributeError, ValueError):
+        return (0, 0)
+_ST_NUEVO = _version_st() >= (1, 49)
+
+def _grafico(fig):
+    if _ST_NUEVO:
+        try:
+            st.plotly_chart(fig, width="stretch")
+            return
+        except TypeError:
+            pass
+    st.plotly_chart(fig, use_container_width=True)
+
+def _mapa_interactivo(mapa, altura=ALTURA_MAPA):
+    if _ST_NUEVO:
+        try:
+            return st_folium(mapa, height=altura, width="stretch",
+                             returned_objects=["last_object_clicked"])
+        except TypeError:
+            pass
+    try:
+        return st_folium(mapa, height=altura, use_container_width=True,
+                         returned_objects=["last_object_clicked"])
+    except TypeError:
+        return st_folium(mapa, height=altura, use_container_width=True)
+
+def _separador(color="#cccccc", margen="6px 0 10px 0", grosor=1):
+    st.markdown(f"<hr style='margin:{margen};border:0;border-top:{grosor}px solid {color}'>",
+                unsafe_allow_html=True)
+
+def _seccion(titulo, emoji, color):
+    st.markdown(
+        f"<div style='font-weight:bold;color:{color};font-size:1.05em;"
+        f"border-bottom:2px solid {color};padding-bottom:2px;margin:2px 0 8px 0'>"
+        f"{emoji} {titulo}</div>", unsafe_allow_html=True)
+
+def _subgrupo(titulo):
+    st.markdown(f"<div style='font-weight:bold;color:#555;font-size:0.88em;"
+                f"margin:10px 0 4px 0'>{titulo}</div>", unsafe_allow_html=True)
 
 def a_segundos(t):
     if t is None:
@@ -243,10 +288,6 @@ def normalizar_dataframe(df):
     return df
 
 def enriquecer_desde_catalogo(df):
-    """Si al CSV de la matriz le faltan (o estan vacias) las columnas de
-    caracteristicas de los centros, se traen del catalogo por CODIGO. La causa
-    tipica es ejecutar la matriz antes que descargar_ensenanzas.py; asi la app
-    deja de depender del orden de ejecucion de la cadena."""
     campos = ("tiene_eso", "tiene_bachillerato", "tiene_fp", "vespertino",
               "nocturno", "bilingue", "jornada")
     if "CODIGO" not in df.columns:
@@ -435,8 +476,10 @@ def gpx_de_itinerario(it):
 
 def main():
     st.set_page_config(layout="wide")
-    st.title("Centros publicos de secundaria y bachillerato por tiempo de transporte")
-    st.caption(f"Desde la vivienda, llegando a las {HORA_LLEGADA} ({FECHA}, planificacion GTFS, sin tiempo real)")
+    st.markdown(
+        f"<div style='font-size:0.95em;color:#777'>Centros públicos de Madrid por tiempo de transporte "
+        f"· desde <b>{DIRECCION_CASA}</b> · llegada <b>{HORA_LLEGADA}</b> ({FECHA}, GTFS)</div>",
+        unsafe_allow_html=True)
 
     casa = geocodificar(DIRECCION_CASA)
     df = cargar_ies()
@@ -450,24 +493,27 @@ def main():
     f = {k: st.session_state[k] for k in DEFECTOS_FILTROS}
     vis = aplicar_filtros(df, f)
 
-    # ============ 1) arriba: numero de centros y desplegable ============
-    # OJO: la seleccion del mapa se aplica via sel_deseado ANTES de crear el
-    # selectbox: asignar st.session_state de un widget despues de crearlo
-    # lanza StreamlitAPIException (el bug del click en v12)
+    # ============ 1) arriba: contador y desplegable ============
+    # sel_deseado se aplica ANTES de crear el selectbox (asignar despues
+    # de crear un widget lanza StreamlitAPIException)
     with st.sidebar:
-        st.markdown("### Centros")
-        st.metric("Visibles en el mapa", len(vis))
+        st.markdown(
+            f"<div style='background:linear-gradient(90deg,#1b7a4a,#2ca02c);color:white;"
+            f"padding:8px 14px;border-radius:10px;font-size:1.1em;font-weight:bold;"
+            f"text-align:center'>📍 {len(vis)} centros visibles</div>",
+            unsafe_allow_html=True)
         opciones = vis["etiqueta"].tolist() if not vis.empty else df["etiqueta"].tolist()[:1]
         if st.session_state.get("sel_deseado") in set(opciones):
             st.session_state["sel_centro"] = st.session_state.pop("sel_deseado")
         if st.session_state.get("sel_centro") not in set(opciones):
             st.session_state["sel_centro"] = opciones[0]
         etiqueta = st.selectbox("Centro a detallar", opciones, key="sel_centro")
+        _separador()
 
-    # ============ 2) debajo: filtros agrupados ============
+    # ============ 2) filtros agrupados ============
     with st.sidebar:
-        st.markdown("### Filtros")
-        st.markdown("**Trayecto**")
+        _seccion("Filtros", "🧭", "#8e44ad")
+        _subgrupo("Trayecto")
         st.checkbox("Excluir buses interurbanos", key="f_interurbanos",
                     help="Si el mejor trayecto usa bus interurbano, se usa la alternativa sin ellos "
                          "(precalculada, mas lenta). Los centros sin alternativa desaparecen.")
@@ -475,26 +521,27 @@ def main():
         st.number_input("Máx. paradas de Cercanías", min_value=0, max_value=60, key="f_paradas",
                         help="Paradas de Renfe Cercanías del trayecto (subida + intermedias + bajada). "
                              "Los centros cuyo trayecto supere este número no se muestran.")
-        st.markdown("**Centro**")
+        _subgrupo("Centro")
         if "tiene_bachillerato" in df.columns:
             st.checkbox("Solo con Bachillerato", key="f_bach")
         if "vespertino" in df.columns:
             st.checkbox("Excluir turno de tarde", key="f_tarde")
         if "tiene_bachillerato" not in df.columns and "vespertino" not in df.columns:
             st.info("Faltan las columnas de enseñanzas: ejecuta descargar_ensenanzas.py "
-                    "(y luego la matriz para propagarlas, aunque la app intenta traerlas del catálogo)")
+                    "(la app intenta traerlas del catálogo en cualquier caso)")
         if "tiene_bachillerato" in df.columns:
             st.caption(f"{int(df['tiene_bachillerato'].sum())} centros con Bachillerato en total"
                        + (f" · {int(df['vespertino'].sum())} con turno tarde"
                           if "vespertino" in df.columns else ""))
         if "TIPO_ABRV" in df.columns:
             st.multiselect("Tipos de centro", sorted(df["TIPO_ABRV"].dropna().unique()), key="f_tipo")
-        st.markdown("**Zona**")
+        _subgrupo("Zona")
         st.multiselect("Municipios", sorted(df["MUNICIPIO"].unique()), key="f_muni")
+        _separador()
 
     # ============ 3) abajo del todo: Excel ============
     with st.sidebar:
-        st.markdown("### Exportar")
+        _seccion("Exportar", "⬇️", "#d84b3b")
         if st.button("Generar Excel de los centros", type="primary", disabled=vis.empty):
             st.session_state["excel_bytes"] = generar_excel(casa, vis, f["f_max_min"])
             st.session_state["excel_filtro"] = f["f_max_min"]
@@ -505,8 +552,16 @@ def main():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 help=f"Centros hasta {st.session_state.get('excel_filtro', f['f_max_min'])} min, con rutas detalladas")
 
+    # ===== panel central: nombre del centro protagonista =====
     d = vis[vis["etiqueta"] == etiqueta].iloc[0] if not vis.empty else df.iloc[0]
     it = pedir_itinerario(casa, (d["lat"], d["lon"]), vetos_de(d, f["f_interurbanos"]))
+
+    st.markdown(
+        f"<h2 style='margin:6px 0 2px 0;color:#1b7a4a'>{html.escape(nombre_completo(d))} "
+        f"<span style='color:#999;font-size:0.55em;font-weight:normal'>· {html.escape(str(d['MUNICIPIO']))}</span></h2>",
+        unsafe_allow_html=True)
+    st.markdown("<hr style='margin:2px 0 10px 0;border:0;border-top:2px solid #1b7a4a'>",
+                unsafe_allow_html=True)
 
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Tiempo total", f"{d['minutos']} min")
@@ -529,7 +584,8 @@ def main():
     if it:
         c_izq, c_der = st.columns([2, 3])
         with c_izq:
-            st.subheader("Desglose por modo")
+            st.markdown("<div style='font-weight:bold;color:#8e44ad;margin-bottom:4px'>📊 Desglose por modo</div>",
+                        unsafe_allow_html=True)
             filas = []
             for c in ORDEN_CATEGORIAS:
                 if dsc[c] > 0.5:
@@ -549,18 +605,19 @@ def main():
             fig.update_layout(showlegend=False, margin=dict(l=0, r=0, t=0, b=0),
                               height=40 + 38 * len(desglose))
             fig.update_yaxes(title=None)
-            st.plotly_chart(fig, use_container_width=True)
+            _grafico(fig)
         with c_der:
-            st.subheader(f"Trayecto completo: {nombre_completo(d)}")
+            st.markdown("<div style='font-weight:bold;color:#8e44ad;margin-bottom:4px'>🚉 Trayecto completo</div>",
+                        unsafe_allow_html=True)
             st.markdown(tabla_tramos_html(it), unsafe_allow_html=True)
         st.download_button("Descargar trayecto (GPX)", gpx_de_itinerario(it),
                            file_name=f"trayecto_{nombre_completo(d).replace(' ', '_')}.gpx",
                            mime="application/gpx")
 
-    st.markdown(f"Mostrando **{len(vis)} centros** en el mapa (hasta {f['f_max_min']} min, "
-                f"max {f['f_paradas']} paradas de Cercanias"
-                + (", sin buses interurbanos" if f["f_interurbanos"] else "") +
-                ") · pincha en uno para cargar su trayecto")
+    st.caption(f"Mostrando **{len(vis)} centros** en el mapa (hasta {f['f_max_min']} min, "
+               f"max {f['f_paradas']} paradas de Cercanias"
+               + (", sin buses interurbanos" if f["f_interurbanos"] else "") +
+               ") · pincha en uno para cargar su trayecto")
     vmax = int(max(df["minutos"].max(), vis["minutos"].max() if not vis.empty else 0))
     escala = branca.colormap.LinearColormap(
         ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"],
@@ -598,11 +655,7 @@ def main():
                             tooltip=f"{nombre_leg(leg)} {hora_local(leg['startTime'])} -> "
                                     f"{hora_local(leg['endTime'])}").add_to(mapa)
 
-    try:
-        respuesta = st_folium(mapa, height=650, use_container_width=True,
-                              returned_objects=["last_object_clicked"])
-    except TypeError:
-        respuesta = st_folium(mapa, height=650, use_container_width=True)
+    respuesta = _mapa_interactivo(mapa)
 
     click = (respuesta or {}).get("last_object_clicked")
     if click:
@@ -611,8 +664,8 @@ def main():
             st.session_state["click_previo"] = clave
             cercano = ies_mas_cercano(vis, click["lat"], click["lng"])
             if cercano and cercano != etiqueta:
-                # sel_deseado NO es clave de widget: asignable aqui sin problema.
-                # El selectbox la aplicara en la siguiente ejecucion, antes de crearse.
+                # sel_deseado NO es clave de widget: la aplica el selectbox
+                # al principio de la siguiente ejecucion
                 st.session_state["sel_deseado"] = cercano
                 try:
                     st.rerun()
