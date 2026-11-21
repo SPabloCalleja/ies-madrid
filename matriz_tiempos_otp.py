@@ -1,9 +1,10 @@
 """
-Paso 2b (v11): matriz de tiempos puerta a puerta con OTP2 via GraphQL (/otp/gtfs/v1).
+Paso 2b (v12): matriz de tiempos puerta a puerta con OTP2 via GraphQL (/otp/gtfs/v1).
+v12: transbordos nunca negativos (los itinerarios 100% a pie daban -1).
 v11: sin filtro de ensenanzas: los candidatos son por TIPO de centro
      (IES/IESO/CEPA/CP INF-PRI-SEC, decididos en descargar_centros.py).
-v10/v9: paradas_cercanias en batch (intermediateStops) y rutas sin buses
-     interurbanos (banned agencies con reintento si aparece otra agencia).
+v9: paradas_cercanias en batch (intermediateStops) y rutas sin buses
+    interurbanos (banned agencies con reintento si aparece otra agencia).
 """
 import requests
 import pandas as pd
@@ -200,13 +201,13 @@ def main():
                         extra.update({
                             "minutos_sin_interurbanos": round(it_sin["duration"] / 60),
                             "paradas_cercanias_sin_interurbanos": paradas_cercanias(it_sin),
-                            "transbordos_sin_interurbanos": sum(
-                                1 for l in it_sin["legs"] if l["mode"] != "WALK") - 1,
+                            "transbordos_sin_interurbanos": max(0, sum(
+                                1 for l in it_sin["legs"] if l["mode"] != "WALK") - 1),
                             "salida_sin_interurbanos": it_sin.get("startTime"),
                         })
             resultados.append({**fila.to_dict(),
                                "minutos": round(it["duration"] / 60),
-                               "transbordos": sum(1 for l in it["legs"] if l["mode"] != "WALK") - 1,
+                               "transbordos": max(0, sum(1 for l in it["legs"] if l["mode"] != "WALK") - 1),
                                "salida": it.get("startTime"),
                                "espera_min": round(espera),
                                "nota": nota,

@@ -1,10 +1,15 @@
 """
-Paso 3 (v11): visualizador Streamlit del miniproyecto de centros de secundaria.
-v11: nombres completos con el tipo de centro (IES, CEPA, CP INF-PRI-SEC...)
-     en el selector, popup, titulo del trayecto y Excel (columna "tipo"),
-     y filtro lateral por tipo de centro.
-v10: paradas de Cercanias del CSV (batch), filtro "Excluir buses interurbanos"
-     usando minutos_sin_interurbanos, desglose con paradas de cercanias.
+Paso 3 (v12): visualizador Streamlit del miniproyecto de centros de secundaria.
+v12:
+  - Barra lateral reordenada: arriba el numero de centros visibles y el
+    desplegable de centro; debajo los filtros agrupados (Trayecto / Centro /
+    Zona); abajo del todo el boton del Excel.
+  - Eliminado el filtro "los que van mejor a pie".
+  - Arreglados "Solo con Bachillerato" y "Excluir turno de tarde" (y el de
+    interurbanos): las columnas True/False llegaban del CSV como texto y las
+    comparaciones con == True nunca casaban. Ahora se normalizan a bool al cargar.
+  - Transbordos nunca negativos: los itinerarios 100% a pie daban -1 (tambien
+    se acota lo que ya haya en el CSV, asi no hace falta re-ejecutar la matriz).
 Requisitos: uv add streamlit streamlit-folium plotly openpyxl
 Ejecutar:   uv run streamlit run app_ies.py   (contenedor OTP arriba)
 """
@@ -26,7 +31,6 @@ FECHA = "2026-11-24"
 HORA_LLEGADA = "08:00"          # debe coincidir con matriz_tiempos_otp.py
 IES_CSV = "ies_por_tiempo_otp.csv"
 OTP = "http://localhost:8080"
-PARADAS_CERCANIAS_DEFECTO = 5
 # =======================================
 
 QUERY_MAPA = """query Plan($from: InputCoordinates!, $to: InputCoordinates!, $arriveBy: Boolean!) {
@@ -56,6 +60,18 @@ ETIQUETA_MODO = {"andando": "andando", "bus_urbano": "bus urbano", "bus_interurb
 EMOJI_MODO = {"andando": "🚶", "bus_urbano": "🚌", "bus_interurbano": "🚌", "metro": "🚇",
               "cercanias": "🚆", "metro_ligero": "🚊", "espera": "⏱", "otro": "•"}
 ORDEN_CATEGORIAS = ["andando", "metro", "bus_urbano", "bus_interurbano", "cercanias", "metro_ligero", "otro"]
+
+DEFECTOS_FILTROS = {
+    "f_interurbanos": True,
+    "f_max_min": 57,
+    "f_paradas": 5,
+    "f_bach": False,
+    "f_tarde": False,
+    "f_tipo": [],
+    "f_muni": [],
+}
+_COLS_BOOL = ("tiene_eso", "tiene_bachillerato", "tiene_fp", "vespertino",
+              "nocturno", "bilingue", "usa_interurbano")
 
 COLUMNAS_EXCEL = [
     ("CENTRO", "IES"),
@@ -151,6 +167,10 @@ def paradas_cercanias(itinerario):
             total += len(leg.get("intermediateStops") or []) + 2
     return total
 
+def transbordos_de(itinerario):
+    """Tramos de transporte menos 1; a pie (0 tramos) -> 0, nunca -1."""
+    return max(0, sum(1 for l in itinerario["legs"] if l["mode"] != "WALK") - 1)
+
 def hora_local(epoch_s):
     from zoneinfo import ZoneInfo
     if not epoch_s:
@@ -208,6 +228,22 @@ def resumen_extra(fila):
         detalles.append("nocturno")
     return " · ".join(detalles) if detalles else ""
 
+def _como_bool(x):
+    if isinstance(x, bool):
+        return x
+    return str(x).strip().lower() in ("true", "1", "verdadero")
+
+def normalizar_dataframe(df):
+    """Arregla lo que llega del CSV: booleans escritos como texto y los
+    transbordos -1 de itinerarios a pie generados por matrices antiguas."""
+    for c in _COLS_BOOL:
+        if c in df.columns:
+            df[c] = df[c].map(_como_bool)
+    for c in ("transbordos", "transbordos_sin_interurbanos"):
+        if c in df.columns:
+            df[c] = df[c].clip(lower=0)
+    return df
+
 @st.cache_data(show_spinner="Geocodificando la vivienda...")
 def geocodificar(direccion):
     r = requests.get("https://nominatim.openstreetmap.org/search",
@@ -221,6 +257,7 @@ def cargar_ies():
     df = pd.read_csv(IES_CSV)
     nombres = df.apply(nombre_completo, axis=1)
     df["etiqueta"] = nombres + " (" + df["MUNICIPIO"] + ")"
+    df = normalizar_dataframe(df)
     return df.sort_values("minutos")
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -239,10 +276,25 @@ def pedir_itinerario(casa, destino, agencias_ban=()):
 def aplicar_filtro_interurbanos(vis, activo):
     if not activo or "usa_interurbano" not in vis.columns:
         return vis
-    vis = vis[(vis["usa_interurbano"] != True) | vis["minutos_sin_interurbanos"].notna()].copy()
-    mask = vis["usa_interurbano"] == True
+    vis = vis[(~vis["usa_interurbano"]) | vis["minutos_sin_interurbanos"].notna()].copy()
+    mask = vis["usa_interurbano"]
     vis.loc[mask, "minutos"] = vis.loc[mask, "minutos_sin_interurbanos"]
     return vis.sort_values("minutos")
+
+def aplicar_filtros(df, f):
+    vis = aplicar_filtro_interurbanos(df, f["f_interurbanos"])
+    vis = vis[vis["minutos"] <= f["f_max_min"]]
+    if f["f_bach"] and "tiene_bachillerato" in vis.columns:
+        vis = vis[vis["tiene_bachillerato"]]
+    if f["f_tarde"] and "vespertino" in vis.columns:
+        vis = vis[~vis["vespertino"]]
+    if f["f_tipo"] and "TIPO_ABRV" in vis.columns:
+        vis = vis[vis["TIPO_ABRV"].isin(f["f_tipo"])]
+    if f["f_muni"]:
+        vis = vis[vis["MUNICIPIO"].isin(f["f_muni"])]
+    if "paradas_cercanias" in vis.columns:
+        vis = vis[vis["paradas_cercanias"].isna() | (vis["paradas_cercanias"] <= f["f_paradas"])]
+    return vis
 
 def vetos_de(fila, activo):
     if not activo:
@@ -368,68 +420,67 @@ def main():
         st.error("No encuentro ies_por_tiempo_otp.csv: ejecuta antes matriz_tiempos_otp.py")
         return
 
+    # los valores de filtro se leen de session_state: al cambiar uno, ya esta
+    # actualizado antes de renderizar los widgets, asi el conteo de arriba
+    # refleja siempre el filtro nuevo sin reruns extra
+    for clave, defecto in DEFECTOS_FILTROS.items():
+        if clave not in st.session_state:
+            st.session_state[clave] = defecto
+    f = {k: st.session_state[k] for k in DEFECTOS_FILTROS}
+    vis = aplicar_filtros(df, f)
+
+    # ============ 1) arriba: numero de centros y desplegable ============
+    with st.sidebar:
+        st.markdown("### Centros")
+        st.metric("Visibles en el mapa", len(vis))
+        opciones = vis["etiqueta"].tolist() if not vis.empty else df["etiqueta"].tolist()[:1]
+        if st.session_state.get("sel_centro") not in set(opciones):
+            st.session_state["sel_centro"] = opciones[0]
+        etiqueta = st.selectbox("Centro a detallar", opciones, key="sel_centro")
+
+    # ============ 2) debajo: filtros agrupados ============
     with st.sidebar:
         st.markdown("### Filtros")
-        excluir_interurbanos = st.checkbox(
-            "Excluir buses interurbanos", True,
-            help="Si el mejor trayecto usa bus interurbano, se usa la alternativa sin ellos "
-                 "(precalculada, mas lenta). Los centros sin alternativa desaparecen.")
-        max_min = st.slider("Minutos maximos", int(df["minutos"].min()), 180, 57, 5)
-        max_paradas = st.number_input(
-            "Max. paradas de Cercanias en el trayecto",
-            min_value=0, max_value=60, value=PARADAS_CERCANIAS_DEFECTO,
-            help="Paradas de Renfe Cercanias del trayecto (subida + intermedias + bajada). "
-                 "Los centros cuyo trayecto supere este numero no se muestran.")
-        solo_a_pie_ok = st.checkbox("Incluir los que van mejor a pie", True)
-        solo_bach = st.checkbox("Solo con Bachillerato", False,
-                                disabled="tiene_bachillerato" not in df.columns)
-        sin_tarde = st.checkbox("Excluir turno de tarde", False,
-                                disabled="vespertino" not in df.columns)
-        sel_muni = st.multiselect("Municipios", sorted(df["MUNICIPIO"].unique()))
-        sel_tipo = st.multiselect("Tipos de centro", sorted(df["TIPO_ABRV"].dropna().unique())
-                                   if "TIPO_ABRV" in df.columns else [])
+        st.markdown("**Trayecto**")
+        st.checkbox("Excluir buses interurbanos", key="f_interurbanos",
+                    help="Si el mejor trayecto usa bus interurbano, se usa la alternativa sin ellos "
+                         "(precalculada, mas lenta). Los centros sin alternativa desaparecen.")
+        st.slider("Minutos máximos", int(df["minutos"].min()), 180, key="f_max_min")
+        st.number_input("Máx. paradas de Cercanías", min_value=0, max_value=60, key="f_paradas",
+                        help="Paradas de Renfe Cercanías del trayecto (subida + intermedias + bajada). "
+                             "Los centros cuyo trayecto supere este número no se muestran.")
+        st.markdown("**Centro**")
+        if {"tiene_bachillerato", "vespertino"}.issubset(df.columns):
+            st.checkbox("Solo con Bachillerato", key="f_bach")
+            st.checkbox("Excluir turno de tarde", key="f_tarde")
+        else:
+            st.info("Ejecuta descargar_ensenanzas.py para activar los filtros de enseñanzas y turnos")
+        if "TIPO_ABRV" in df.columns:
+            st.multiselect("Tipos de centro", sorted(df["TIPO_ABRV"].dropna().unique()), key="f_tipo")
+        st.markdown("**Zona**")
+        st.multiselect("Municipios", sorted(df["MUNICIPIO"].unique()), key="f_muni")
 
-    vis = aplicar_filtro_interurbanos(df, excluir_interurbanos)
-    vis = vis[vis["minutos"] <= max_min]
-    if not solo_a_pie_ok:
-        vis = vis[vis["nota"] != "a pie"]
-    if solo_bach and "tiene_bachillerato" in vis.columns:
-        vis = vis[vis["tiene_bachillerato"] == True]
-    if sin_tarde and "vespertino" in vis.columns:
-        vis = vis[~(vis["vespertino"] == True)]
-    if sel_muni:
-        vis = vis[vis["MUNICIPIO"].isin(sel_muni)]
-    if sel_tipo and "TIPO_ABRV" in vis.columns:
-        vis = vis[vis["TIPO_ABRV"].isin(sel_tipo)]
-    if "paradas_cercanias" in vis.columns:
-        vis = vis[vis["paradas_cercanias"].isna() | (vis["paradas_cercanias"] <= max_paradas)]
-    st.sidebar.success(f"**{len(vis)} centros** en el mapa")
-
-    if st.sidebar.button("Generar Excel de los centros", type="primary", disabled=vis.empty):
-        st.session_state["excel_bytes"] = generar_excel(casa, vis, max_min)
-        st.session_state["excel_filtro"] = max_min
-    if st.session_state.get("excel_bytes"):
-        st.sidebar.download_button(
-            "Descargar Excel", st.session_state["excel_bytes"],
-            file_name=f"centros_{max_min}min_{FECHA}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help=f"Centros hasta {st.session_state.get('excel_filtro', max_min)} min, con rutas detalladas")
-
-    opciones = vis["etiqueta"].tolist() if not vis.empty else df["etiqueta"].tolist()[:1]
-    if st.session_state.get("seleccion") not in set(opciones):
-        st.session_state["seleccion"] = opciones[0]
-    etiqueta = st.sidebar.selectbox("Centro a detallar", opciones,
-                                    index=opciones.index(st.session_state["seleccion"]))
-    st.session_state["seleccion"] = etiqueta
+    # ============ 3) abajo del todo: Excel ============
+    with st.sidebar:
+        st.markdown("### Exportar")
+        if st.button("Generar Excel de los centros", type="primary", disabled=vis.empty):
+            st.session_state["excel_bytes"] = generar_excel(casa, vis, f["f_max_min"])
+            st.session_state["excel_filtro"] = f["f_max_min"]
+        if st.session_state.get("excel_bytes"):
+            st.download_button(
+                "Descargar Excel", st.session_state["excel_bytes"],
+                file_name=f"centros_{f['f_max_min']}min_{FECHA}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help=f"Centros hasta {st.session_state.get('excel_filtro', f['f_max_min'])} min, con rutas detalladas")
 
     d = vis[vis["etiqueta"] == etiqueta].iloc[0] if not vis.empty else df.iloc[0]
-    it = pedir_itinerario(casa, (d["lat"], d["lon"]), vetos_de(d, excluir_interurbanos))
+    it = pedir_itinerario(casa, (d["lat"], d["lon"]), vetos_de(d, f["f_interurbanos"]))
 
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Tiempo total", f"{d['minutos']} min")
     if it:
         dsc, espera, km_andando = desglosar(it)
-        col2.metric("Transbordos", sum(1 for l in it["legs"] if l["mode"] != "WALK") - 1)
+        col2.metric("Transbordos", transbordos_de(it))
         col3.metric("Salida de casa", hora_local(it["startTime"]))
         col4.metric("Esperas", f"{espera:.0f} min")
     else:
@@ -474,9 +525,9 @@ def main():
                            file_name=f"trayecto_{nombre_completo(d).replace(' ', '_')}.gpx",
                            mime="application/gpx")
 
-    st.markdown(f"Mostrando **{len(vis)} centros** en el mapa (hasta {max_min} min, "
-                f"max {max_paradas} paradas de Cercanias"
-                + (", sin buses interurbanos" if excluir_interurbanos else "") +
+    st.markdown(f"Mostrando **{len(vis)} centros** en el mapa (hasta {f['f_max_min']} min, "
+                f"max {f['f_paradas']} paradas de Cercanias"
+                + (", sin buses interurbanos" if f["f_interurbanos"] else "") +
                 ") · pincha en uno para cargar su trayecto")
     vmax = int(max(df["minutos"].max(), vis["minutos"].max() if not vis.empty else 0))
     escala = branca.colormap.LinearColormap(
@@ -528,7 +579,7 @@ def main():
             st.session_state["click_previo"] = clave
             cercano = ies_mas_cercano(vis, click["lat"], click["lng"])
             if cercano and cercano != etiqueta:
-                st.session_state["seleccion"] = cercano
+                st.session_state["sel_centro"] = cercano
                 try:
                     st.rerun()
                 except AttributeError:
