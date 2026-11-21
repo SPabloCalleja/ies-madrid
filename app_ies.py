@@ -1,16 +1,11 @@
 """
-Paso 3 (v14): visualizador Streamlit del miniproyecto de centros de secundaria.
-v14:
-  - use_container_width deprecado: se usa width="stretch" (con deteccion de
-    version y fallback para Streamlit viejo). Adios al warning.
-  - Menu lateral compacto: contador en una sola linea (badge con degradado),
-    secciones con cabeceras de color y separadores; selectbox justo debajo.
-  - Panel central: sin titulo gigante; cabecera ligera de una linea, nombre
-    del centro destacado arriba (con color) y barra separadora antes de las
-    metricas. Los subtitulos de desglose/trayecto mas discretos.
-  - Mapa algo mas pequeno (520 px).
-v13: click del mapa arreglado (sel_deseado), columnas de caracteristicas
-     auto-traidas del catalogo, filtros Bachillerato/tarde arreglados.
+Paso 3 (v15): visualizador Streamlit del miniproyecto de centros de secundaria.
+v15: nuevo filtro "Minutos andando maximos" (defecto 23, tope 45), junto al de
+     minutos totales; usa el min_andando del desglose que calcula la matriz.
+v14: width="stretch" (adios warning), menu lateral compacto con secciones,
+     panel central con el nombre del centro protagonista, mapa 520 px.
+v13: click del mapa arreglado (sel_deseado), caracteristicas auto-traidas del
+     catalogo, filtros Bachillerato/tarde arreglados.
 Requisitos: uv add streamlit streamlit-folium plotly openpyxl
 Ejecutar:   uv run streamlit run app_ies.py   (contenedor OTP arriba)
 """
@@ -34,6 +29,7 @@ IES_CSV = "ies_por_tiempo_otp.csv"
 CATALOGO_CSV = "ies_publicos_madrid.csv"
 OTP = "http://localhost:8080"
 ALTURA_MAPA = 520
+MAX_MIN_ANDANDO = 45
 # =======================================
 
 QUERY_MAPA = """query Plan($from: InputCoordinates!, $to: InputCoordinates!, $arriveBy: Boolean!) {
@@ -67,6 +63,7 @@ ORDEN_CATEGORIAS = ["andando", "metro", "bus_urbano", "bus_interurbano", "cercan
 DEFECTOS_FILTROS = {
     "f_interurbanos": True,
     "f_max_min": 57,
+    "f_andando": 23,
     "f_paradas": 5,
     "f_bach": False,
     "f_tarde": False,
@@ -349,6 +346,8 @@ def aplicar_filtro_interurbanos(vis, activo):
 def aplicar_filtros(df, f):
     vis = aplicar_filtro_interurbanos(df, f["f_interurbanos"])
     vis = vis[vis["minutos"] <= f["f_max_min"]]
+    if "min_andando" in vis.columns:
+        vis = vis[vis["min_andando"].isna() | (vis["min_andando"] <= f["f_andando"])]
     if f["f_bach"] and "tiene_bachillerato" in vis.columns:
         vis = vis[vis["tiene_bachillerato"]]
     if f["f_tarde"] and "vespertino" in vis.columns:
@@ -494,8 +493,6 @@ def main():
     vis = aplicar_filtros(df, f)
 
     # ============ 1) arriba: contador y desplegable ============
-    # sel_deseado se aplica ANTES de crear el selectbox (asignar despues
-    # de crear un widget lanza StreamlitAPIException)
     with st.sidebar:
         st.markdown(
             f"<div style='background:linear-gradient(90deg,#1b7a4a,#2ca02c);color:white;"
@@ -518,6 +515,9 @@ def main():
                     help="Si el mejor trayecto usa bus interurbano, se usa la alternativa sin ellos "
                          "(precalculada, mas lenta). Los centros sin alternativa desaparecen.")
         st.slider("Minutos máximos", int(df["minutos"].min()), 180, key="f_max_min")
+        st.slider("Minutos andando máximo", 0, MAX_MIN_ANDANDO, key="f_andando",
+                  help="Minutos totales a pie del trayecto, sumando todos los tramos de caminata. "
+                       "Los centros cuyo trayecto los supere no se muestran.")
         st.number_input("Máx. paradas de Cercanías", min_value=0, max_value=60, key="f_paradas",
                         help="Paradas de Renfe Cercanías del trayecto (subida + intermedias + bajada). "
                              "Los centros cuyo trayecto supere este número no se muestran.")
@@ -542,7 +542,7 @@ def main():
     # ============ 3) abajo del todo: Excel ============
     with st.sidebar:
         _seccion("Exportar", "⬇️", "#d84b3b")
-        if st.button("Generar Excel de los centros", type="primary", disabled=vis.empty):
+        if st.button("Generar Excel de los centros", type="primary", disabled=vis.empty()):
             st.session_state["excel_bytes"] = generar_excel(casa, vis, f["f_max_min"])
             st.session_state["excel_filtro"] = f["f_max_min"]
         if st.session_state.get("excel_bytes"):
@@ -614,8 +614,8 @@ def main():
                            file_name=f"trayecto_{nombre_completo(d).replace(' ', '_')}.gpx",
                            mime="application/gpx")
 
-    st.caption(f"Mostrando **{len(vis)} centros** en el mapa (hasta {f['f_max_min']} min, "
-               f"max {f['f_paradas']} paradas de Cercanias"
+    st.caption(f"Mostrando **{len(vis)} centros** en el mapa (hasta {f['f_max_min']} min totales, "
+               f"max {f['f_andando']} min andando, {f['f_paradas']} paradas de Cercanias"
                + (", sin buses interurbanos" if f["f_interurbanos"] else "") +
                ") · pincha en uno para cargar su trayecto")
     vmax = int(max(df["minutos"].max(), vis["minutos"].max() if not vis.empty else 0))
@@ -664,8 +664,6 @@ def main():
             st.session_state["click_previo"] = clave
             cercano = ies_mas_cercano(vis, click["lat"], click["lng"])
             if cercano and cercano != etiqueta:
-                # sel_deseado NO es clave de widget: la aplica el selectbox
-                # al principio de la siguiente ejecucion
                 st.session_state["sel_deseado"] = cercano
                 try:
                     st.rerun()
