@@ -1,27 +1,32 @@
 """
 Descarga versiones frescas de los GTFS caducados y los sustituye in situ
-dejando una copia .bak. (v3)
+dejando una copia .bak. (v4)
 
-Fuentes, en este orden:
-  1) URLs DIRECTAS de los items de ArcGIS (crtm.maps.arcgis.com), que publica
-     Mobility Database como URLs productoras de cada feed, y el GTFS semanal
-     oficial de EMT. No hace falta ningun catalogo.
-  2) Catalogo DCAT del portal del CRTM (por si las URLs directas cambian).
-  3) A mano de tres formas:
-       uv run descargar_gtfs.py --url "https://...zip" [--sobre viejo.zip]
-       uv run descargar_gtfs.py --fichero google_transit_M4.zip [--sobre viejo.zip]
-       o simplemente: borra el viejo y deja el nuevo con cualquier nombre
-     (el modo --fichero valida, sustituye al viejo y retira el descargado
-     para que no queden DOS feeds de metro en la carpeta)
+Contexto: el dataset de METRO del portal del CRTM lleva sin publicarse desde
+mayo de 2025 (version 20250527, caduca 2026-05-27). El canal oficial que
+queda por probar es el Punto de Acceso Nacional (NAP) del Ministerio
+(nap.transportes.gob.es), que exige registro gratuito y ApiKey. Este script
+sabe hablar con el NAP: listar sus ficheros y descargarlos.
+
+Fuentes automaticas, en orden:
+  1) URLs DIRECTAS de los items de ArcGIS del CRTM (algunos vivos: metro
+     ligero, EMT...; el de metro esta huerfano) y el GTFS semanal de EMT.
+  2) Catalogo DCAT del portal del CRTM.
+  3) NAP del Ministerio (necesita --apikey): listar y descargar.
+  4) A mano:
+       uv run descargar_gtfs.py --fichero X.zip [--sobre viejo.zip]
+       uv run descargar_gtfs.py --url "https://..." [--sobre viejo.zip]
 
 Antes de reemplazar nada valida que el zip es GTFS, que cubre la fecha de
 calculo (2026-11-24) y que la agencia casa con la del feed viejo.
 
-Uso:  uv run descargar_gtfs.py                          (solo los caducados)
-      uv run descargar_gtfs.py --todo                   (todos los feeds)
-      uv run descargar_gtfs.py --fichero X [--sobre Y]  (instala uno descargado)
-      uv run descargar_gtfs.py --url X [--sobre Y]      (instala desde URL)
-      uv run descargar_gtfs.py --debug                  (ver codigos HTTP)
+Uso:
+  uv run descargar_gtfs.py                            (solo los caducados)
+  uv run descargar_gtfs.py --todo
+  uv run descargar_gtfs.py --apikey K --nap-listar metro
+  uv run descargar_gtfs.py --apikey K --nap ID [--sobre viejo.zip]
+  uv run descargar_gtfs.py --fichero X [--sobre Y]  ·  --url X [--sobre Y]
+  uv run descargar_gtfs.py --debug
 
 Despues: reconstruir el grafo de OTP y re-ejecutar matriz_tiempos_otp.py.
 """
@@ -42,20 +47,20 @@ CABECERA = {
                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Accept": "*/*",
 }
+NAP = "https://nap.transportes.gob.es"
 TIEMPO_ESPERA = 90
 DEPURAR = "--debug" in sys.argv
 
 _ITEM = "https://crtm.maps.arcgis.com/sharing/rest/content/items/%s/data"
 _ITEM_ALT = "https://www.arcgis.com/sharing/rest/content/items/%s/data"
 
-# URLs candidatas por red, en orden de preferencia
 CANDIDATOS = {
     "metro": [
-        _ITEM % "5c7f2951962540d69ffe8f640d94c246",      # mdb-794 (productor oficial)
+        _ITEM % "5c7f2951962540d69ffe8f640d94c246",      # huerfano desde 2025-05
         _ITEM_ALT % "5c7f2951962540d69ffe8f640d94c246",
     ],
     "metro ligero": [
-        _ITEM % "aaed26cc0ff64b0c947ac0bc3e03196",       # mdb-792
+        _ITEM % "aaed26cc0ff64b0c947ac0bc3e03196",       # vivo (mdb-2802)
         _ITEM_ALT % "aaed26cc0ff64b0c947ac0bc3e03196",
     ],
     "urbanos EMT": [
@@ -89,7 +94,7 @@ TIPOS = [
 ]
 
 PAGINAS_MANUALES = {
-    "metro": "https://datos.crtm.es/datasets/5c7f2951962540d69ffe8f640d94c246",
+    "metro": "https://datos.crtm.es/datasets/5c7f2951962540d69ffe8f640d94c246 (huerfano desde 2025-05; prueba el NAP)",
     "metro ligero": "https://datos.crtm.es/datasets/aaed26cc0ff64b0c947ac0bc3e03196",
     "urbanos EMT": "https://datos.crtm.es/datasets/357e63c2904f43aeb5d8a267a64346d8",
     "interurbanos": "https://datos.crtm.es/datasets/885399f83408473c8d815e40c5e702b7",
@@ -126,7 +131,6 @@ def clasificar_tipo(agencia, fichero):
 
 
 def feeds_locales():
-    """[(fichero, agencia, inicio, fin)] de los GTFS zip de la carpeta."""
     salida = []
     for z in sorted(glob.glob("*.zip")):
         try:
@@ -140,8 +144,9 @@ def feeds_locales():
     return salida
 
 
-def bajar(url, binario=True):
-    r = requests.get(url, headers=CABECERA, timeout=TIEMPO_ESPERA, allow_redirects=True)
+def bajar(url, binario=True, cabeceras=None):
+    r = requests.get(url, headers=cabeceras or CABECERA, timeout=TIEMPO_ESPERA,
+                     allow_redirects=True)
     if DEPURAR:
         print(f"    [http] {r.status_code} {url[:90]}")
     r.raise_for_status()
@@ -149,7 +154,6 @@ def bajar(url, binario=True):
 
 
 def validar_zip(datos, agencia_vieja=None):
-    """(agencia, fin) del zip nuevo, o None si no es GTFS valido."""
     try:
         with zipfile.ZipFile(io.BytesIO(datos)) as f:
             if "agency.txt" not in f.namelist():
@@ -225,7 +229,6 @@ def url_para(tipo, datasets):
 
 
 def descargar_para(tipo, agencia_vieja):
-    """Prueba las URLs directas y, si ninguna valida, el DCAT."""
     for url in CANDIDATOS.get(tipo, []):
         print(f"  descargando {url} ...")
         try:
@@ -254,10 +257,64 @@ def descargar_para(tipo, agencia_vieja):
     return None, None
 
 
+# ------------------------- NAP (Ministerio) -------------------------
+
+def _cab_nap(clave):
+    return {"ApiKey": clave, "accept": "application/json"}
+
+def nap_listar(clave, filtro=None):
+    """Lista de ficheros del NAP (filtrada por texto) -> [(id, resumen)]."""
+    texto = bajar(f"{NAP}/api/Fichero/GetList", binario=False, cabeceras=_cab_nap(clave))
+    datos = json.loads(texto)
+    if isinstance(datos, dict):
+        datos = datos.get("data") or datos.get("resultado") or datos.get("lista") or []
+    filas = []
+    for it in datos if isinstance(datos, list) else []:
+        if not isinstance(it, dict):
+            continue
+        dump = json.dumps(it, ensure_ascii=False)
+        if filtro and filtro.lower() not in dump.lower():
+            continue
+        ident = next((it[k] for k in ("id", "Id", "ID", "ficheroId", "ficheroId1")
+                      if k in it and it[k] is not None), "?")
+        resumen = " · ".join(str(v) for v in it.values()
+                             if isinstance(v, str) and len(str(v)) > 2)[:90]
+        filas.append((ident, resumen))
+    return filas
+
+def nap_descargar(clave, fichero_id):
+    """downloadLink/{id} devuelve un enlace firmado; si no, prueba download/{id}."""
+    for url in (f"{NAP}/api/Fichero/downloadLink/{fichero_id}",
+                f"{NAP}/api/Fichero/download/{fichero_id}"):
+        try:
+            r = requests.get(url, headers=_cab_nap(clave), timeout=TIEMPO_ESPERA,
+                             allow_redirects=True)
+        except requests.RequestException:
+            continue
+        if DEPURAR:
+            print(f"    [http] {r.status_code} {url[:90]}")
+        if r.status_code != 200:
+            continue
+        enlace = None
+        try:
+            j = r.json()
+            if isinstance(j, str) and j.startswith("http"):
+                enlace = j
+            elif isinstance(j, dict):
+                enlace = next((v for v in j.values()
+                               if isinstance(v, str) and v.startswith("http")), None)
+        except ValueError:
+            if r.text.strip().startswith("http"):
+                enlace = r.text.strip()
+        if enlace:
+            return bajar(enlace)
+        ctype = r.headers.get("content-type", "")
+        if "json" not in ctype and len(r.content) > 1000:
+            return r.content
+    return None
+
+
 def instalar_manual(datos, ruta_origen=None, forzar_sobre=None):
-    """Valida un zip nuevo (descargado a mano o por URL) y sustituye al viejo
-    que tenga la misma agencia. Si ruta_origen es un zip de esta carpeta, se
-    retira tras instalarlo para no dejar la red duplicada."""
     valido = validar_zip(datos)
     if valido is None:
         print("El zip no valida: no parece GTFS, no cubre el "
@@ -269,9 +326,10 @@ def instalar_manual(datos, ruta_origen=None, forzar_sobre=None):
     if forzar_sobre is not None:
         objetivo = forzar_sobre
     else:
+        origen = os.path.basename(ruta_origen) if ruta_origen else None
         parecidos = [z for z, a, _, _ in locales
-                     if a and a.split()[0].lower() in ag.lower()]
-        if len(parecidos) == 1 and ruta_origen != parecidos[0]:
+                     if a and a.split()[0].lower() in ag.lower() and z != origen]
+        if len(parecidos) == 1:
             objetivo = parecidos[0]
             print(f"Sustituira a tu feed local: {objetivo}")
         elif len(parecidos) == 0:
@@ -285,22 +343,54 @@ def instalar_manual(datos, ruta_origen=None, forzar_sobre=None):
             print("Candidatos:", ", ".join(parecidos))
             return False
     instalar(objetivo, datos, valido)
-    if ruta_origen and os.path.exists(ruta_origen) and os.path.abspath(ruta_origen) != os.path.abspath(objetivo):
+    if (ruta_origen and os.path.exists(ruta_origen)
+            and os.path.abspath(ruta_origen) != os.path.abspath(objetivo)):
         os.remove(ruta_origen)
         print(f"  retirado {ruta_origen} (ya esta instalado dentro de {objetivo})")
     print("Recuerda reconstruir el grafo de OTP y re-ejecutar la matriz.")
     return True
 
 
+def _valor(argv, opcion):
+    return argv[argv.index(opcion) + 1] if opcion in argv else None
+
+
 def main():
     argv = sys.argv[1:]
-    if "--fichero" in argv:
-        i = argv.index("--fichero")
-        if i + 1 >= len(argv):
-            print("uso: --fichero RUTA.zip [--sobre viejo.zip]")
+    if "--nap-listar" in argv:
+        clave = _valor(argv, "--apikey")
+        if not clave:
+            print("hace falta --apikey TUCLAVE (registro gratuito en nap.transportes.gob.es)")
             return
-        ruta = argv[i + 1]
-        sobre = argv[argv.index("--sobre") + 1] if "--sobre" in argv else None
+        filtro = argv[argv.index("--nap-listar") + 1] if len(argv) > argv.index("--nap-listar") + 1 else None
+        try:
+            filas = nap_listar(clave, filtro)
+        except (requests.RequestException, ValueError) as e:
+            print(f"No pude listar el NAP: {e}")
+            return
+        print(f"{len(filas)} ficheros del NAP"
+              + (f" que contienen '{filtro}'" if filtro else "") + ":")
+        for ident, resumen in filas[:80]:
+            print(f"  {str(ident):8} {resumen}")
+        print("\nPara descargar uno: uv run descargar_gtfs.py --apikey K --nap ID")
+        return
+    if "--nap" in argv:
+        clave = _valor(argv, "--apikey")
+        ident = _valor(argv, "--nap")
+        sobre = _valor(argv, "--sobre")
+        if not (clave and ident):
+            print("uso: --apikey CLAVE --nap ID [--sobre viejo.zip]")
+            return
+        print(f"Descargando del NAP el fichero {ident} ...")
+        datos = nap_descargar(clave, ident)
+        if datos is None:
+            print("No pude descargarlo del NAP (revisa la ApiKey y el ID; --debug ayuda)")
+            return
+        instalar_manual(datos, ruta_origen=None, forzar_sobre=sobre)
+        return
+    if "--fichero" in argv:
+        ruta = _valor(argv, "--fichero")
+        sobre = _valor(argv, "--sobre")
         try:
             with open(ruta, "rb") as f:
                 datos = f.read()
@@ -310,12 +400,8 @@ def main():
         instalar_manual(datos, ruta_origen=ruta, forzar_sobre=sobre)
         return
     if "--url" in argv:
-        i = argv.index("--url")
-        if i + 1 >= len(argv):
-            print("uso: --url URL [--sobre viejo.zip]")
-            return
-        url = argv[i + 1]
-        sobre = argv[argv.index("--sobre") + 1] if "--sobre" in argv else None
+        url = _valor(argv, "--url")
+        sobre = _valor(argv, "--sobre")
         print(f"Descargando {url} ...")
         try:
             datos = bajar(url)
@@ -353,6 +439,8 @@ def main():
         datos, valido = descargar_para(tipo, ag)
         if datos is None:
             print(f"  ninguna fuente valido; a mano: {PAGINAS_MANUALES.get(tipo, 'datos.crtm.es')}")
+            print("  o registra una ApiKey gratuita en nap.transportes.gob.es y usa:")
+            print("  uv run descargar_gtfs.py --apikey K --nap-listar metro")
             fallos += 1
             continue
         instalar(z, datos, valido)
