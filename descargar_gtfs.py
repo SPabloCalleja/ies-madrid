@@ -1,21 +1,27 @@
 """
 Descarga versiones frescas de los GTFS caducados y los sustituye in situ
-dejando una copia .bak. (v2)
+dejando una copia .bak. (v3)
 
 Fuentes, en este orden:
   1) URLs DIRECTAS de los items de ArcGIS (crtm.maps.arcgis.com), que publica
      Mobility Database como URLs productoras de cada feed, y el GTFS semanal
      oficial de EMT. No hace falta ningun catalogo.
   2) Catalogo DCAT del portal del CRTM (por si las URLs directas cambian).
-  3) Modo manual: uv run descargar_gtfs.py --url "https://...zip"
+  3) A mano de tres formas:
+       uv run descargar_gtfs.py --url "https://...zip" [--sobre viejo.zip]
+       uv run descargar_gtfs.py --fichero google_transit_M4.zip [--sobre viejo.zip]
+       o simplemente: borra el viejo y deja el nuevo con cualquier nombre
+     (el modo --fichero valida, sustituye al viejo y retira el descargado
+     para que no queden DOS feeds de metro en la carpeta)
 
 Antes de reemplazar nada valida que el zip es GTFS, que cubre la fecha de
 calculo (2026-11-24) y que la agencia casa con la del feed viejo.
 
-Uso:  uv run descargar_gtfs.py                        (solo los caducados)
-      uv run descargar_gtfs.py --todo                 (todos los feeds)
-      uv run descargar_gtfs.py --url X [--sobre Y.zip] (manual, valida y cambia)
-      uv run descargar_gtfs.py --debug                (ver codigos HTTP)
+Uso:  uv run descargar_gtfs.py                          (solo los caducados)
+      uv run descargar_gtfs.py --todo                   (todos los feeds)
+      uv run descargar_gtfs.py --fichero X [--sobre Y]  (instala uno descargado)
+      uv run descargar_gtfs.py --url X [--sobre Y]      (instala desde URL)
+      uv run descargar_gtfs.py --debug                  (ver codigos HTTP)
 
 Despues: reconstruir el grafo de OTP y re-ejecutar matriz_tiempos_otp.py.
 """
@@ -62,7 +68,7 @@ CANDIDATOS = {
         _ITEM_ALT % "885399f83408473c8d815e40c5e702b7",
     ],
     "cercanias": [
-        _ITEM % "1a25440bf66f499bae2657ec7fb40144",      # dataset cercanias
+        _ITEM % "1a25440bf66f499bae2657ec7fb40144",
         _ITEM_ALT % "1a25440bf66f499bae2657ec7fb40144",
     ],
 }
@@ -119,6 +125,21 @@ def clasificar_tipo(agencia, fichero):
     return None
 
 
+def feeds_locales():
+    """[(fichero, agencia, inicio, fin)] de los GTFS zip de la carpeta."""
+    salida = []
+    for z in sorted(glob.glob("*.zip")):
+        try:
+            with zipfile.ZipFile(z) as f:
+                if "agency.txt" not in f.namelist():
+                    continue
+                ag, inicio, fin = rango_feed(f)
+        except zipfile.BadZipFile:
+            continue
+        salida.append((z, ag, inicio, fin))
+    return salida
+
+
 def bajar(url, binario=True):
     r = requests.get(url, headers=CABECERA, timeout=TIEMPO_ESPERA, allow_redirects=True)
     if DEPURAR:
@@ -127,7 +148,7 @@ def bajar(url, binario=True):
     return r.content if binario else r.text
 
 
-def validar_zip(datos, agencia_vieja):
+def validar_zip(datos, agencia_vieja=None):
     """(agencia, fin) del zip nuevo, o None si no es GTFS valido."""
     try:
         with zipfile.ZipFile(io.BytesIO(datos)) as f:
@@ -233,30 +254,86 @@ def descargar_para(tipo, agencia_vieja):
     return None, None
 
 
+def instalar_manual(datos, ruta_origen=None, forzar_sobre=None):
+    """Valida un zip nuevo (descargado a mano o por URL) y sustituye al viejo
+    que tenga la misma agencia. Si ruta_origen es un zip de esta carpeta, se
+    retira tras instalarlo para no dejar la red duplicada."""
+    valido = validar_zip(datos)
+    if valido is None:
+        print("El zip no valida: no parece GTFS, no cubre el "
+              f"{FECHA_OBJETIVO} o no se puede leer")
+        return False
+    ag, fin = valido
+    print(f"Feed de: {ag} · servicio hasta {fin}")
+    locales = feeds_locales()
+    if forzar_sobre is not None:
+        objetivo = forzar_sobre
+    else:
+        parecidos = [z for z, a, _, _ in locales
+                     if a and a.split()[0].lower() in ag.lower()]
+        if len(parecidos) == 1 and ruta_origen != parecidos[0]:
+            objetivo = parecidos[0]
+            print(f"Sustituira a tu feed local: {objetivo}")
+        elif len(parecidos) == 0:
+            print("No encuentro un feed local de esa agencia; dime donde "
+                  "instalarlo: --sobre NOMBRE.zip")
+            print("Feeds locales:", ", ".join(z for z, a, _, _ in locales) or "ninguno")
+            return False
+        else:
+            print("Hay varios feeds que podrian ser el mismo; concretame: "
+                  "--sobre NOMBRE.zip")
+            print("Candidatos:", ", ".join(parecidos))
+            return False
+    instalar(objetivo, datos, valido)
+    if ruta_origen and os.path.exists(ruta_origen) and os.path.abspath(ruta_origen) != os.path.abspath(objetivo):
+        os.remove(ruta_origen)
+        print(f"  retirado {ruta_origen} (ya esta instalado dentro de {objetivo})")
+    print("Recuerda reconstruir el grafo de OTP y re-ejecutar la matriz.")
+    return True
+
+
 def main():
     argv = sys.argv[1:]
+    if "--fichero" in argv:
+        i = argv.index("--fichero")
+        if i + 1 >= len(argv):
+            print("uso: --fichero RUTA.zip [--sobre viejo.zip]")
+            return
+        ruta = argv[i + 1]
+        sobre = argv[argv.index("--sobre") + 1] if "--sobre" in argv else None
+        try:
+            with open(ruta, "rb") as f:
+                datos = f.read()
+        except OSError as e:
+            print(f"No puedo leer {ruta}: {e}")
+            return
+        instalar_manual(datos, ruta_origen=ruta, forzar_sobre=sobre)
+        return
     if "--url" in argv:
-        return modo_manual(argv)
+        i = argv.index("--url")
+        if i + 1 >= len(argv):
+            print("uso: --url URL [--sobre viejo.zip]")
+            return
+        url = argv[i + 1]
+        sobre = argv[argv.index("--sobre") + 1] if "--sobre" in argv else None
+        print(f"Descargando {url} ...")
+        try:
+            datos = bajar(url)
+        except requests.RequestException as e:
+            print(f"ERROR descargando: {e}")
+            return
+        instalar_manual(datos, ruta_origen=None, forzar_sobre=sobre)
+        return
 
     todo = "--todo" in argv
-    zips = sorted(p for p in glob.glob("*.zip"))
-    locales = []
-    for z in zips:
-        try:
-            with zipfile.ZipFile(z) as f:
-                if "agency.txt" not in f.namelist():
-                    continue
-                ag, _, fin = rango_feed(f)
-        except zipfile.BadZipFile:
-            continue
-        locales.append((z, ag, fin))
+    locales = feeds_locales()
     if not locales:
         print("No hay GTFS .zip en esta carpeta: ejecutame donde los tengas")
         return
 
     print(f"Fecha de calculo del proyecto: {FECHA_OBJETIVO[:4]}-{FECHA_OBJETIVO[4:6]}-{FECHA_OBJETIVO[6:]}")
     objetivo = []
-    for z, ag, fin in locales:
+    for z, ag, _, fin in locales:
         caducado = (fin is None) or (fin < FECHA_OBJETIVO)
         tipo = clasificar_tipo(ag, z)
         print(f"  {z:40} {ag[:24]:26} fin {fin or '???'}  "
@@ -285,54 +362,6 @@ def main():
     if ok:
         print("Siguientes pasos: reconstruir el grafo de OTP (docker build +")
         print("reinicio del contenedor) y re-ejecutar matriz_tiempos_otp.py.")
-
-
-def modo_manual(argv):
-    i = argv.index("--url")
-    if i + 1 >= len(argv):
-        print("uso: --url URL [--sobre fichero.zip]")
-        return
-    url = argv[i + 1]
-    zips = sorted(p for p in glob.glob("*.zip"))
-    sobre = None
-    if "--sobre" in argv:
-        j = argv.index("--sobre")
-        sobre = argv[j + 1]
-    print(f"Descargando {url} ...")
-    try:
-        datos = bajar(url)
-    except requests.RequestException as e:
-        print(f"ERROR descargando: {e}")
-        return
-    ag, _, fin = None, None, None
-    try:
-        with zipfile.ZipFile(io.BytesIO(datos)) as f:
-            if "agency.txt" in f.namelist():
-                ag, _, fin = rango_feed(f)
-    except zipfile.BadZipFile:
-        pass
-    if ag is None:
-        print("Lo descargado no parece un GTFS (sin agency.txt)")
-        return
-    print(f"Feed de: {ag} · servicio hasta {fin}")
-    if fin and fin < FECHA_OBJETIVO:
-        print(f"AVISO: no cubre el {FECHA_OBJETIVO} (termina {fin})")
-    if sobre is None:
-        candidatos = [(z, a) for z, a in
-                      [(z, rango_feed(zipfile.ZipFile(z))[0]) for z in zips
-                       if zipfile.is_zipfile(z)]
-                      if a and a.split()[0].lower() in (ag or "").lower()]
-        if len(candidatos) == 1:
-            sobre = candidatos[0][0]
-            print(f"Coincide con tu feed local: {sobre}")
-        else:
-            print("Dime en que fichero lo instalo: --sobre NOMBRE.zip")
-            print("Feeds locales:", ", ".join(z for z, a in
-                  [(z, rango_feed(zipfile.ZipFile(z))[0]) for z in zips
-                   if zipfile.is_zipfile(z)] if a))
-            return
-    instalar(sobre, datos, (ag, fin))
-    print("Recuerda reconstruir el grafo de OTP y re-ejecutar la matriz.")
 
 
 if __name__ == "__main__":
