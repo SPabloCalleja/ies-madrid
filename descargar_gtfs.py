@@ -1,21 +1,19 @@
 """
 Descarga versiones frescas de los GTFS caducados y los sustituye in situ
-dejando una copia .bak. (v4)
+dejando una copia .bak. (v5)
 
 Contexto: el dataset de METRO del portal del CRTM lleva sin publicarse desde
 mayo de 2025 (version 20250527, caduca 2026-05-27). El canal oficial que
 queda por probar es el Punto de Acceso Nacional (NAP) del Ministerio
 (nap.transportes.gob.es), que exige registro gratuito y ApiKey. Este script
-sabe hablar con el NAP: listar sus ficheros y descargarlos.
+sabe hablar con el NAP: buscar por operador, listar ficheros y descargarlos.
 
 Fuentes automaticas, en orden:
   1) URLs DIRECTAS de los items de ArcGIS del CRTM (algunos vivos: metro
      ligero, EMT...; el de metro esta huerfano) y el GTFS semanal de EMT.
   2) Catalogo DCAT del portal del CRTM.
-  3) NAP del Ministerio (necesita --apikey): listar y descargar.
-  4) A mano:
-       uv run descargar_gtfs.py --fichero X.zip [--sobre viejo.zip]
-       uv run descargar_gtfs.py --url "https://..." [--sobre viejo.zip]
+  3) NAP del Ministerio (necesita --apikey).
+  4) A mano: --fichero X.zip o --url, con validacion y .bak.
 
 Antes de reemplazar nada valida que el zip es GTFS, que cubre la fecha de
 calculo (2026-11-24) y que la agencia casa con la del feed viejo.
@@ -23,7 +21,8 @@ calculo (2026-11-24) y que la agencia casa con la del feed viejo.
 Uso:
   uv run descargar_gtfs.py                            (solo los caducados)
   uv run descargar_gtfs.py --todo
-  uv run descargar_gtfs.py --apikey K --nap-listar metro
+  uv run descargar_gtfs.py --apikey K --operador "Metro de Madrid"
+  uv run descargar_gtfs.py --apikey K --nap-listar [texto]
   uv run descargar_gtfs.py --apikey K --nap ID [--sobre viejo.zip]
   uv run descargar_gtfs.py --fichero X [--sobre Y]  ·  --url X [--sobre Y]
   uv run descargar_gtfs.py --debug
@@ -36,6 +35,7 @@ import json
 import os
 import shutil
 import sys
+import urllib.parse
 import zipfile
 
 import requests
@@ -84,7 +84,6 @@ DCAT = [
 ]
 
 # (tipo, pistas en agency_name del zip viejo, pistas en el nombre del fichero)
-# ojo al orden: interurbanos antes que urbanos ("interurbanos" contiene "urban")
 TIPOS = [
     ("metro ligero", ["ligero", "tranv"], ["ligero", "tranv"]),
     ("metro", ["metro de madrid"], ["metro"]),
@@ -262,25 +261,77 @@ def descargar_para(tipo, agencia_vieja):
 def _cab_nap(clave):
     return {"ApiKey": clave, "accept": "application/json"}
 
+def nap_get(ruta, clave):
+    r = requests.get(f"{NAP}{ruta}", headers=_cab_nap(clave), timeout=TIEMPO_ESPERA)
+    if DEPURAR:
+        print(f"    [http] {r.status_code} {ruta[:80]}")
+    r.raise_for_status()
+    return r.json()
+
+def _iterar_dicts(nodo):
+    if isinstance(nodo, dict):
+        yield nodo
+        for v in nodo.values():
+            yield from _iterar_dicts(v)
+    elif isinstance(nodo, list):
+        for v in nodo:
+            yield from _iterar_dicts(v)
+
+def _valores_texto(nodo):
+    if isinstance(nodo, str):
+        return [nodo]
+    if isinstance(nodo, dict):
+        return [s for v in nodo.values() for s in _valores_texto(v)]
+    if isinstance(nodo, list):
+        return [s for v in nodo for s in _valores_texto(v)]
+    return []
+
+def _id_de(d):
+    return next((d[k] for k in ("id", "Id", "ID", "ficheroId", "ficheroID")
+                 if k in d and d[k] is not None), None)
+
 def nap_listar(clave, filtro=None):
-    """Lista de ficheros del NAP (filtrada por texto) -> [(id, resumen)]."""
-    texto = bajar(f"{NAP}/api/Fichero/GetList", binario=False, cabeceras=_cab_nap(clave))
-    datos = json.loads(texto)
-    if isinstance(datos, dict):
-        datos = datos.get("data") or datos.get("resultado") or datos.get("lista") or []
+    """Nodos con id del GetList (conjuntos y sus ficheros anidados), filtrados."""
+    datos = nap_get("/api/Fichero/GetList", clave)
+    if DEPURAR:
+        print("    [nap] cabecera de la respuesta:", str(datos)[:400])
     filas = []
-    for it in datos if isinstance(datos, list) else []:
-        if not isinstance(it, dict):
+    for d in _iterar_dicts(datos):
+        ident = _id_de(d)
+        if ident is None:
             continue
-        dump = json.dumps(it, ensure_ascii=False)
-        if filtro and filtro.lower() not in dump.lower():
+        resumen = " · ".join(v for v in _valores_texto(d) if len(v) > 2)[:110]
+        if filtro and filtro.lower() not in resumen.lower():
             continue
-        ident = next((it[k] for k in ("id", "Id", "ID", "ficheroId", "ficheroId1")
-                      if k in it and it[k] is not None), "?")
-        resumen = " · ".join(str(v) for v in it.values()
-                             if isinstance(v, str) and len(str(v)) > 2)[:90]
         filas.append((ident, resumen))
     return filas
+
+def nap_operador(clave, nombre):
+    """Conjuntos de datos de un operador (p.ej. 'Metro de Madrid')."""
+    ruta = "/api/Operador/GetByName/" + urllib.parse.quote(nombre)
+    try:
+        datos = nap_get(ruta, clave)
+    except (requests.RequestException, ValueError) as e:
+        print(f"No pude consultar el operador: {e}")
+        return
+    filas = []
+    for d in _iterar_dicts(datos):
+        ident = _id_de(d)
+        if ident is None:
+            continue
+        resumen = " · ".join(v for v in _valores_texto(d) if len(v) > 2)[:110]
+        if any(p in resumen.lower() for p in ("gtfs", "horario", "frecuencia", "calendario")):
+            filas.append((ident, resumen))
+    if filas:
+        print(f"Nodos relacionados con horarios/GTFS del operador '{nombre}':")
+        for ident, resumen in filas[:60]:
+            print(f"  {str(ident):8} {resumen}")
+    else:
+        print("Ningun nodo de horarios/GTFS; volcado crudo (recortado):")
+        print(json.dumps(datos, ensure_ascii=False, indent=1)[:2500])
+        return
+    print("\nPara descargar un fichero: --apikey K --nap ID (prueba tambien")
+    print("--nap-listar 'nombre del conjunto' para ver todos sus ficheros)")
 
 def nap_descargar(clave, fichero_id):
     """downloadLink/{id} devuelve un enlace firmado; si no, prueba download/{id}."""
@@ -357,22 +408,33 @@ def _valor(argv, opcion):
 
 def main():
     argv = sys.argv[1:]
+    if "--operador" in argv:
+        clave = _valor(argv, "--apikey")
+        nombre = _valor(argv, "--operador")
+        if not (clave and nombre):
+            print('uso: --apikey CLAVE --operador "Metro de Madrid"')
+            return
+        nap_operador(clave, nombre)
+        return
     if "--nap-listar" in argv:
         clave = _valor(argv, "--apikey")
         if not clave:
             print("hace falta --apikey TUCLAVE (registro gratuito en nap.transportes.gob.es)")
             return
-        filtro = argv[argv.index("--nap-listar") + 1] if len(argv) > argv.index("--nap-listar") + 1 else None
+        i = argv.index("--nap-listar")
+        filtro = argv[i + 1] if len(argv) > i + 1 and not argv[i + 1].startswith("--") else None
         try:
             filas = nap_listar(clave, filtro)
         except (requests.RequestException, ValueError) as e:
             print(f"No pude listar el NAP: {e}")
             return
-        print(f"{len(filas)} ficheros del NAP"
+        print(f"{len(filas)} nodos del NAP"
               + (f" que contienen '{filtro}'" if filtro else "") + ":")
         for ident, resumen in filas[:80]:
             print(f"  {str(ident):8} {resumen}")
-        print("\nPara descargar uno: uv run descargar_gtfs.py --apikey K --nap ID")
+        if not filas:
+            print("(si sale 0, prueba sin filtro o con --debug para ver la respuesta)")
+        print("\nPara descargar un fichero: uv run descargar_gtfs.py --apikey K --nap ID")
         return
     if "--nap" in argv:
         clave = _valor(argv, "--apikey")
@@ -440,7 +502,7 @@ def main():
         if datos is None:
             print(f"  ninguna fuente valido; a mano: {PAGINAS_MANUALES.get(tipo, 'datos.crtm.es')}")
             print("  o registra una ApiKey gratuita en nap.transportes.gob.es y usa:")
-            print("  uv run descargar_gtfs.py --apikey K --nap-listar metro")
+            print('  uv run descargar_gtfs.py --apikey K --operador "Metro de Madrid"')
             fallos += 1
             continue
         instalar(z, datos, valido)
